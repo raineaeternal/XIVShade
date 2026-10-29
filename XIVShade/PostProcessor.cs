@@ -1,8 +1,12 @@
 using System;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Kernel;
+using FFXIVClientStructs.FFXIV.Client.Graphics.PostEffect;
+using FFXIVClientStructs.Interop;
 using TerraFX.Interop.DirectX;
 using TerraFX.Interop.Windows;
 using static TerraFX.Interop.DirectX.D3D11;
@@ -12,7 +16,9 @@ using static TerraFX.Interop.Windows.Windows;
 namespace XIVShade;
 
 /// <summary>
-/// Runs a fullscreen pixel shader over the game's backbuffer just before it is presented.
+/// Runs a fullscreen pixel shader over the game's scene image, after the post-effect chain and before the UI is drawn.
+/// The game records its render commands on the main thread and executes them on the render thread, so the pass is
+/// queued as a callback command rather than run from a hook.
 /// </summary>
 public sealed unsafe class PostProcessor : IDisposable
 {
@@ -50,12 +56,27 @@ float4 PS(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     return float4(ApplyLuma(BackBuffer, uv, 1.0), 1.0);
 }";
 
+    // Command buffer layout of a callback command (ImmediateContext.ExecuteCommands, type 0xE): function at +0x8,
+    // argument at +0x10, "reset the state cache around the call" flag at +0x18.
+    private const uint CallbackCommandType = 0xE;
+    private const int CallbackSize = 0x20;
+
+    private delegate void CallbackDelegate(nint* arguments);
+    private delegate void RenderChainDelegate(PostEffectChain* chain);
     private delegate int PresentDelegate(IDXGISwapChain* swapChain, uint syncInterval, uint flags);
-    private delegate int ResizeBuffersDelegate(IDXGISwapChain* swapChain, uint bufferCount, uint width, uint height, DXGI_FORMAT format, uint flags);
+
+    // PostEffectChain.Render: records the commands for each part of the chain.
+    private const string RenderChainSignature = "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 65 48 8B 04 25 ?? ?? ?? ?? 48 8B F9";
 
     private readonly IPluginLog log;
+    private readonly Hook<RenderChainDelegate> renderChainHook;
     private readonly Hook<PresentDelegate> presentHook;
-    private readonly Hook<ResizeBuffersDelegate> resizeHook;
+
+    // Held for the plugin's lifetime: the render thread calls it from the command buffer.
+    private readonly CallbackDelegate callback;
+    private readonly nint callbackFunction;
+    private volatile bool stopped;
+    private volatile bool enabled;
 
     private ID3D11Device* device;
     private ID3D11DeviceContext* context;
@@ -69,7 +90,7 @@ float4 PS(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     private uint copyWidth, copyHeight;
     private DXGI_FORMAT copyFormat;
 
-    public PostProcessor(IGameInteropProvider interop, IPluginLog log)
+    public PostProcessor(ISigScanner sigScanner, IGameInteropProvider interop, IPluginLog log)
     {
         this.log = log;
 
@@ -78,8 +99,6 @@ float4 PS(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             throw new InvalidOperationException("Game renderer does not exist");
 
         var swapChain = (IDXGISwapChain*)gameDevice->SwapChain->DXGISwapChain;
-        var vtable = *(nint**)swapChain;
-
         fixed (ID3D11Device** pDevice = &device)
             ThrowIfFailed(swapChain->GetDevice(__uuidof<ID3D11Device>(), (void**)pDevice));
         fixed (ID3D11DeviceContext** pContext = &context)
@@ -87,14 +106,32 @@ float4 PS(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
         CreatePipeline();
 
-        presentHook = interop.HookFromAddress<PresentDelegate>(vtable[8], PresentDetour);
-        resizeHook = interop.HookFromAddress<ResizeBuffersDelegate>(vtable[13], ResizeBuffersDetour);
+        callback = Run;
+        callbackFunction = Marshal.GetFunctionPointerForDelegate(callback);
+
+        // The scene is finished once the vignetting chain's commands run, and the UI is drawn on top afterwards.
+        // Queue ours right after that chain's commands, with the same view and sort key, so it executes next
+        // (commands are merge-sorted by key, equal keys keep submission order).
+        renderChainHook = interop.HookFromAddress<RenderChainDelegate>(sigScanner.ScanText(RenderChainSignature), RenderChainDetour);
+        renderChainHook.Enable();
+
+        // For IncludeUi: the UI may be drawn on its own layer and frames may be generated and written straight to
+        // the back buffer (UpscaleBuddy), so the only place every presented image, UI included, is reliably
+        // visible is the swapchain's Present.
+        presentHook = interop.HookFromAddress<PresentDelegate>((*(nint**)swapChain)[8], PresentDetour);
         presentHook.Enable();
-        resizeHook.Enable();
         log.Information("Post-processor installed");
     }
 
-    public bool Enabled { get; set; }
+    public bool Enabled
+    {
+        get => enabled;
+        set => enabled = value;
+    }
+
+    /// <summary>Apply the effect after the UI has been drawn, instead of to the scene only.</summary>
+    public bool IncludeUi { get; set; }
+
 
     private static void ThrowIfFailed(HRESULT hr)
     {
@@ -203,65 +240,75 @@ float4 PS(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         copyFormat = backDesc.Format;
     }
 
-    private void Apply(IDXGISwapChain* swapChain)
+    /// <summary>Runs the effect over <paramref name="target"/>, reading a copy of it and drawing back through <paramref name="rtv"/>.</summary>
+    private void Apply(ID3D11Texture2D* target, ID3D11RenderTargetView* rtv)
     {
-        ID3D11Texture2D* backBuffer = null;
-        ThrowIfFailed(swapChain->GetBuffer(0, __uuidof<ID3D11Texture2D>(), (void**)&backBuffer));
+        D3D11_TEXTURE2D_DESC desc;
+        target->GetDesc(&desc);
+        EnsureCopy(desc);
 
-        ID3D11RenderTargetView* rtv = null;
+        context->CopyResource((ID3D11Resource*)copy, (ID3D11Resource*)target);
+
+        var saved = new SavedState(context);
         try
         {
-            D3D11_TEXTURE2D_DESC backDesc;
-            backBuffer->GetDesc(&backDesc);
-            EnsureCopy(backDesc);
+            var viewport = new D3D11_VIEWPORT(0, 0, desc.Width, desc.Height);
+            context->IASetInputLayout(null);
+            context->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY.D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context->VSSetShader(vertexShader, null, 0);
+            context->HSSetShader(null, null, 0);
+            context->DSSetShader(null, null, 0);
+            context->GSSetShader(null, null, 0);
+            context->PSSetShader(pixelShader, null, 0);
 
-            context->CopyResource((ID3D11Resource*)copy, (ID3D11Resource*)backBuffer);
-            ThrowIfFailed(device->CreateRenderTargetView((ID3D11Resource*)backBuffer, null, &rtv));
+            var view = copyView;
+            var samp = sampler;
+            context->PSSetShaderResources(0, 1, &view);
+            context->PSSetSamplers(0, 1, &samp);
 
-            var saved = new SavedState(context);
-            try
-            {
-                var viewport = new D3D11_VIEWPORT(0, 0, backDesc.Width, backDesc.Height);
-                context->IASetInputLayout(null);
-                context->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY.D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                context->VSSetShader(vertexShader, null, 0);
-                context->HSSetShader(null, null, 0);
-                context->DSSetShader(null, null, 0);
-                context->GSSetShader(null, null, 0);
-                context->PSSetShader(pixelShader, null, 0);
+            context->RSSetState(rasterizer);
+            context->RSSetViewports(1, &viewport);
+            context->OMSetBlendState(null, null, 0xFFFFFFFF);
+            context->OMSetDepthStencilState(null, 0);
+            var target0 = rtv;
+            context->OMSetRenderTargets(1, &target0, null);
 
-                var view = copyView;
-                var samp = sampler;
-                context->PSSetShaderResources(0, 1, &view);
-                context->PSSetSamplers(0, 1, &samp);
-
-                context->RSSetState(rasterizer);
-                context->RSSetViewports(1, &viewport);
-                context->OMSetBlendState(null, null, 0xFFFFFFFF);
-                context->OMSetDepthStencilState(null, 0);
-                context->OMSetRenderTargets(1, &rtv, null);
-
-                context->Draw(3, 0);
-            }
-            finally
-            {
-                saved.Restore(context);
-            }
+            context->Draw(3, 0);
         }
         finally
         {
-            if (rtv != null) rtv->Release();
-            backBuffer->Release();
+            saved.Restore(context);
         }
     }
 
+    /// <summary>Main thread: a post-effect chain's commands are being recorded.</summary>
+    private void RenderChainDetour(PostEffectChain* chain)
+    {
+        renderChainHook.Original(chain);
+
+        if (!Enabled || stopped || IncludeUi)
+            return;
+
+        try
+        {
+            if (chain == &PostEffectManager.Instance()->VignettingChain)
+                QueueCallback();
+        }
+        catch (Exception ex)
+        {
+            Enabled = false;
+            log.Error(ex, "Failed to queue post-processing, disabling");
+        }
+    }
+
+    /// <summary>Render thread: a frame is about to be presented.</summary>
     private int PresentDetour(IDXGISwapChain* swapChain, uint syncInterval, uint flags)
     {
-        if (Enabled)
+        if (Enabled && IncludeUi && !stopped)
         {
             try
             {
-                Apply(swapChain);
+                ApplyToBackBuffer(swapChain);
             }
             catch (Exception ex)
             {
@@ -273,17 +320,73 @@ float4 PS(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         return presentHook.Original(swapChain, syncInterval, flags);
     }
 
-    private int ResizeBuffersDetour(IDXGISwapChain* swapChain, uint bufferCount, uint width, uint height, DXGI_FORMAT format, uint flags)
+    private void ApplyToBackBuffer(IDXGISwapChain* swapChain)
     {
-        ReleaseCopy();
-        return resizeHook.Original(swapChain, bufferCount, width, height, format, flags);
+        ID3D11Texture2D* backBuffer = null;
+        ThrowIfFailed(swapChain->GetBuffer(0, __uuidof<ID3D11Texture2D>(), (void**)&backBuffer));
+
+        ID3D11RenderTargetView* rtv = null;
+        try
+        {
+            ThrowIfFailed(device->CreateRenderTargetView((ID3D11Resource*)backBuffer, null, &rtv));
+            Apply(backBuffer, rtv);
+        }
+        finally
+        {
+            if (rtv != null) rtv->Release();
+            backBuffer->Release();
+        }
+    }
+
+    private void QueueCallback()
+    {
+        var kernelContext = ThreadLocals.ThreadLocalInstance()->GraphicsKernelContext;
+        var command = (byte*)kernelContext->AllocateCommand(CallbackSize);
+        if (command == null)
+            return;
+
+        *(uint*)command = CallbackCommandType;
+        *(nint*)(command + 0x8) = callbackFunction;
+        *(nint*)(command + 0x10) = 0;
+        command[0x18] = 1; // callbacks that change state directly need the game to reset its state cache around them
+        kernelContext->PushBackCommand(command);
+    }
+
+    /// <summary>Render thread, after the target texture is complete.</summary>
+    private void Run(nint* arguments)
+    {
+        if (!Enabled || stopped)
+            return;
+
+        try
+        {
+            // The last part of the vignetting chain writes the display-resolution image the UI is then drawn on.
+            var chain = &PostEffectManager.Instance()->VignettingChain;
+            if (chain->PartCount == 0)
+                return;
+
+            var output = chain->Parts[chain->PartCount - 1]->OutputTextures[0].Value;
+            if (output == null || output->D3D11Texture2D == null || output->MipRenderTargets == null)
+                return;
+
+            Apply((ID3D11Texture2D*)output->D3D11Texture2D, (ID3D11RenderTargetView*)output->GetMipRenderTarget(0)->D3D11RenderTargetViewOrDepthStencilView);
+        }
+        catch (Exception ex)
+        {
+            Enabled = false;
+            log.Error(ex, "Post-processing failed, disabling");
+        }
     }
 
     public void Dispose()
     {
         Enabled = false;
+        stopped = true;
+        renderChainHook.Dispose();
         presentHook.Dispose();
-        resizeHook.Dispose();
+
+        // Commands already queued still call into this plugin; give the render thread a moment to drain them.
+        Thread.Sleep(250);
 
         ReleaseCopy();
         if (rasterizer != null) rasterizer->Release();

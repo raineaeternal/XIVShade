@@ -13,6 +13,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
     [PluginService] internal static ICommandManager CommandManager { get; private set; } = null!;
     [PluginService] internal static IPluginLog Log { get; private set; } = null!;
+    [PluginService] internal static ISigScanner SigScanner { get; private set; } = null!;
     [PluginService] internal static IGameInteropProvider GameInterop { get; private set; } = null!;
 
     private const string CommandName = "/xivshade";
@@ -29,14 +30,14 @@ public sealed class Plugin : IDalamudPlugin
 
         try
         {
-            postProcessor = new PostProcessor(GameInterop, Log);
+            postProcessor = new PostProcessor(SigScanner, GameInterop, Log) { IncludeUi = Configuration.IncludeUi };
         }
         catch (Exception ex)
         {
             Log.Error(ex, "Failed to set up post-processing");
         }
 
-        mainWindow = new MainWindow(postProcessor);
+        mainWindow = new MainWindow(Configuration, postProcessor);
         windowSystem.AddWindow(mainWindow);
 
         CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
