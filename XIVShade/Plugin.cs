@@ -13,6 +13,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
     [PluginService] internal static ICommandManager CommandManager { get; private set; } = null!;
     [PluginService] internal static IPluginLog Log { get; private set; } = null!;
+    [PluginService] internal static ITextureProvider TextureProvider { get; private set; } = null!;
     [PluginService] internal static ISigScanner SigScanner { get; private set; } = null!;
     [PluginService] internal static IGameInteropProvider GameInterop { get; private set; } = null!;
 
@@ -30,7 +31,7 @@ public sealed class Plugin : IDalamudPlugin
 
         try
         {
-            postProcessor = new PostProcessor(SigScanner, GameInterop, Log) { IncludeUi = Configuration.IncludeUi };
+            postProcessor = new PostProcessor(SigScanner, GameInterop, TextureProvider, Log, Configuration, PluginInterface.GetPluginConfigDirectory()) { Enabled = Configuration.Enabled, IncludeUi = Configuration.IncludeUi };
         }
         catch (Exception ex)
         {

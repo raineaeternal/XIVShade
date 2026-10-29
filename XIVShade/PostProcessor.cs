@@ -1,6 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
-using System.Text;
+using System.Diagnostics;
 using System.Threading;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
@@ -8,6 +8,7 @@ using FFXIVClientStructs.FFXIV.Client.Graphics.Kernel;
 using FFXIVClientStructs.FFXIV.Client.Graphics.PostEffect;
 using FFXIVClientStructs.Interop;
 using TerraFX.Interop.DirectX;
+using XIVShade.Effects;
 using TerraFX.Interop.Windows;
 using static TerraFX.Interop.DirectX.D3D11;
 using static TerraFX.Interop.DirectX.DirectX;
@@ -16,46 +17,13 @@ using static TerraFX.Interop.Windows.Windows;
 namespace XIVShade;
 
 /// <summary>
-/// Runs a fullscreen pixel shader over the game's scene image, after the post-effect chain and before the UI is drawn.
+/// Runs ReShade-style effects over the game's scene image, after the post-effect chain and before the UI is drawn.
 /// The game records its render commands on the main thread and executes them on the render thread, so the pass is
-/// queued as a callback command rather than run from a hook.
+/// queued as a callback command rather than run from a hook. With <see cref="IncludeUi"/> the effects run on the
+/// presented image instead.
 /// </summary>
 public sealed unsafe class PostProcessor : IDisposable
 {
-    // Mirrors the HLSL shape reshadefx generates (sampler as a struct, samplers passed into functions,
-    // uniforms in a cbuffer) so we know the game's shader compiler accepts it.
-    private const string Shader = @"
-struct __sampler2D_float4 { Texture2D<float4> t; SamplerState s; };
-
-Texture2D<float4> BackBufferTex : register(t0);
-SamplerState BackBufferSamp : register(s0);
-static const __sampler2D_float4 BackBuffer = { BackBufferTex, BackBufferSamp };
-
-cbuffer _Globals : register(b0)
-{
-    float Strength = 1.0;
-};
-
-float4 tex2D(__sampler2D_float4 s, float2 uv) { return s.t.Sample(s.s, uv); }
-
-float3 ApplyLuma(__sampler2D_float4 s, float2 uv, float amount)
-{
-    float3 c = tex2D(s, uv).rgb;
-    float luma = dot(c, float3(0.2126, 0.7152, 0.0722));
-    return lerp(c, luma.xxx, amount);
-}
-
-void VS(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD0)
-{
-    uv = float2((id << 1) & 2, id & 2);
-    pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
-}
-
-float4 PS(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
-{
-    return float4(ApplyLuma(BackBuffer, uv, 1.0), 1.0);
-}";
-
     // Command buffer layout of a callback command (ImmediateContext.ExecuteCommands, type 0xE): function at +0x8,
     // argument at +0x10, "reset the state cache around the call" flag at +0x18.
     private const uint CallbackCommandType = 0xE;
@@ -80,17 +48,19 @@ float4 PS(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
     private ID3D11Device* device;
     private ID3D11DeviceContext* context;
-    private ID3D11VertexShader* vertexShader;
-    private ID3D11PixelShader* pixelShader;
-    private ID3D11SamplerState* sampler;
     private ID3D11RasterizerState* rasterizer;
 
     private ID3D11Texture2D* copy;
-    private ID3D11ShaderResourceView* copyView;
+    private ID3D11ShaderResourceView* copyLinear;
+    private ID3D11ShaderResourceView* copySrgb;
     private uint copyWidth, copyHeight;
     private DXGI_FORMAT copyFormat;
 
-    public PostProcessor(ISigScanner sigScanner, IGameInteropProvider interop, IPluginLog log)
+    private readonly Stopwatch clock = Stopwatch.StartNew();
+    private long lastFrameTicks;
+    private uint frameCount;
+
+    public PostProcessor(ISigScanner sigScanner, IGameInteropProvider interop, ITextureProvider textureProvider, IPluginLog log, Configuration configuration, string configDirectory)
     {
         this.log = log;
 
@@ -104,7 +74,9 @@ float4 PS(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         fixed (ID3D11DeviceContext** pContext = &context)
             device->GetImmediateContext(pContext);
 
-        CreatePipeline();
+        CreateRasterizer();
+        Effects = new EffectManager(device, textureProvider, log, configuration, configDirectory);
+        Effects.Rescan();
 
         callback = Run;
         callbackFunction = Marshal.GetFunctionPointerForDelegate(callback);
@@ -123,6 +95,8 @@ float4 PS(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         log.Information("Post-processor installed");
     }
 
+    public EffectManager Effects { get; }
+
     public bool Enabled
     {
         get => enabled;
@@ -139,62 +113,8 @@ float4 PS(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             throw new InvalidOperationException($"HRESULT 0x{hr.Value:X8}");
     }
 
-    private ID3DBlob* Compile(string entry, string target)
+    private void CreateRasterizer()
     {
-        var source = Encoding.ASCII.GetBytes(Shader);
-        var entryName = Encoding.ASCII.GetBytes(entry + "\0");
-        var targetName = Encoding.ASCII.GetBytes(target + "\0");
-
-        ID3DBlob* code = null;
-        ID3DBlob* errors = null;
-        HRESULT hr;
-        fixed (byte* pSource = source)
-        fixed (byte* pEntry = entryName)
-        fixed (byte* pTarget = targetName)
-            hr = D3DCompile(pSource, (nuint)source.Length, null, null, null, (sbyte*)pEntry, (sbyte*)pTarget, 0, 0, &code, &errors);
-
-        if (hr.FAILED)
-        {
-            var message = errors != null
-                ? Encoding.ASCII.GetString((byte*)errors->GetBufferPointer(), (int)errors->GetBufferSize())
-                : $"HRESULT 0x{hr.Value:X8}";
-            if (errors != null) errors->Release();
-            throw new InvalidOperationException($"Shader compile failed ({entry}): {message}");
-        }
-
-        if (errors != null) errors->Release();
-        return code;
-    }
-
-    private void CreatePipeline()
-    {
-        var vs = Compile("VS", "vs_5_0");
-        var ps = Compile("PS", "ps_5_0");
-        try
-        {
-            fixed (ID3D11VertexShader** pVs = &vertexShader)
-                ThrowIfFailed(device->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), null, pVs));
-            fixed (ID3D11PixelShader** pPs = &pixelShader)
-                ThrowIfFailed(device->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), null, pPs));
-        }
-        finally
-        {
-            vs->Release();
-            ps->Release();
-        }
-
-        var samplerDesc = new D3D11_SAMPLER_DESC
-        {
-            Filter = D3D11_FILTER.D3D11_FILTER_MIN_MAG_MIP_POINT,
-            AddressU = D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_CLAMP,
-            AddressV = D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_CLAMP,
-            AddressW = D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_CLAMP,
-            ComparisonFunc = D3D11_COMPARISON_FUNC.D3D11_COMPARISON_NEVER,
-            MaxLOD = float.MaxValue,
-        };
-        fixed (ID3D11SamplerState** pSampler = &sampler)
-            ThrowIfFailed(device->CreateSamplerState(&samplerDesc, pSampler));
-
         var rasterizerDesc = new D3D11_RASTERIZER_DESC
         {
             FillMode = D3D11_FILL_MODE.D3D11_FILL_SOLID,
@@ -207,10 +127,23 @@ float4 PS(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
     private void ReleaseCopy()
     {
-        if (copyView != null) { copyView->Release(); copyView = null; }
+        if (copyLinear != null) { copyLinear->Release(); copyLinear = null; }
+        if (copySrgb != null) { copySrgb->Release(); copySrgb = null; }
         if (copy != null) { copy->Release(); copy = null; }
         copyWidth = copyHeight = 0;
     }
+
+    /// <summary>The typeless resource format for a back buffer format, and the views effects read it through.</summary>
+    private static (DXGI_FORMAT Resource, DXGI_FORMAT Linear, DXGI_FORMAT Srgb) CopyFormats(DXGI_FORMAT format) => format switch
+    {
+        DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM or DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM_SRGB or DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_TYPELESS =>
+            (DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM_SRGB),
+        DXGI_FORMAT.DXGI_FORMAT_B8G8R8X8_UNORM or DXGI_FORMAT.DXGI_FORMAT_B8G8R8X8_UNORM_SRGB or DXGI_FORMAT.DXGI_FORMAT_B8G8R8X8_TYPELESS =>
+            (DXGI_FORMAT.DXGI_FORMAT_B8G8R8X8_TYPELESS, DXGI_FORMAT.DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT.DXGI_FORMAT_B8G8R8X8_UNORM_SRGB),
+        DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM or DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB or DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_TYPELESS =>
+            (DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB),
+        _ => (format, format, format),
+    };
 
     private void EnsureCopy(D3D11_TEXTURE2D_DESC backDesc)
     {
@@ -219,61 +152,78 @@ float4 PS(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
         ReleaseCopy();
 
+        var (resourceFormat, linearFormat, srgbFormat) = CopyFormats(backDesc.Format);
         var desc = new D3D11_TEXTURE2D_DESC
         {
             Width = backDesc.Width,
             Height = backDesc.Height,
             MipLevels = 1,
             ArraySize = 1,
-            Format = backDesc.Format,
+            Format = resourceFormat,
             SampleDesc = new DXGI_SAMPLE_DESC(1, 0),
             Usage = D3D11_USAGE.D3D11_USAGE_DEFAULT,
             BindFlags = (uint)D3D11_BIND_FLAG.D3D11_BIND_SHADER_RESOURCE,
         };
         fixed (ID3D11Texture2D** pCopy = &copy)
             ThrowIfFailed(device->CreateTexture2D(&desc, null, pCopy));
-        fixed (ID3D11ShaderResourceView** pView = &copyView)
-            ThrowIfFailed(device->CreateShaderResourceView((ID3D11Resource*)copy, null, pView));
+
+        var viewDesc = new D3D11_SHADER_RESOURCE_VIEW_DESC
+        {
+            Format = linearFormat,
+            ViewDimension = D3D_SRV_DIMENSION.D3D_SRV_DIMENSION_TEXTURE2D,
+        };
+        viewDesc.Texture2D.MipLevels = 1;
+        fixed (ID3D11ShaderResourceView** pView = &copyLinear)
+            ThrowIfFailed(device->CreateShaderResourceView((ID3D11Resource*)copy, &viewDesc, pView));
+        viewDesc.Format = srgbFormat;
+        fixed (ID3D11ShaderResourceView** pView = &copySrgb)
+            ThrowIfFailed(device->CreateShaderResourceView((ID3D11Resource*)copy, &viewDesc, pView));
 
         copyWidth = backDesc.Width;
         copyHeight = backDesc.Height;
         copyFormat = backDesc.Format;
     }
 
-    /// <summary>Runs the effect over <paramref name="target"/>, reading a copy of it and drawing back through <paramref name="rtv"/>.</summary>
-    private void Apply(ID3D11Texture2D* target, ID3D11RenderTargetView* rtv)
+    /// <summary>Runs the effects over <paramref name="target"/>, drawing back through <paramref name="rtv"/>.</summary>
+    private void Apply(ID3D11Texture2D* target, ID3D11RenderTargetView* rtv, ID3D11ShaderResourceView* depth)
     {
         D3D11_TEXTURE2D_DESC desc;
         target->GetDesc(&desc);
+        if (!Effects.PrepareFrame(desc.Width, desc.Height))
+            return;
+
         EnsureCopy(desc);
 
-        context->CopyResource((ID3D11Resource*)copy, (ID3D11Resource*)target);
+        var now = clock.ElapsedTicks;
+        var frame = new FrameInputs
+        {
+            Context = context,
+            Target = target,
+            TargetView = rtv,
+            ColorCopy = copy,
+            ColorLinear = copyLinear,
+            ColorSrgb = copySrgb,
+            Depth = depth,
+            Width = desc.Width,
+            Height = desc.Height,
+            FrameTimeMs = lastFrameTicks == 0 ? 0 : (float)((now - lastFrameTicks) * 1000.0 / Stopwatch.Frequency),
+            TimerMs = (float)(now * 1000.0 / Stopwatch.Frequency),
+            FrameCount = frameCount++,
+        };
+        lastFrameTicks = now;
 
         var saved = new SavedState(context);
         try
         {
-            var viewport = new D3D11_VIEWPORT(0, 0, desc.Width, desc.Height);
+            // Fullscreen triangles from SV_VertexID: no vertex input, no culling, no depth, no other shader stages.
             context->IASetInputLayout(null);
-            context->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY.D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            context->VSSetShader(vertexShader, null, 0);
             context->HSSetShader(null, null, 0);
             context->DSSetShader(null, null, 0);
             context->GSSetShader(null, null, 0);
-            context->PSSetShader(pixelShader, null, 0);
-
-            var view = copyView;
-            var samp = sampler;
-            context->PSSetShaderResources(0, 1, &view);
-            context->PSSetSamplers(0, 1, &samp);
-
             context->RSSetState(rasterizer);
-            context->RSSetViewports(1, &viewport);
-            context->OMSetBlendState(null, null, 0xFFFFFFFF);
             context->OMSetDepthStencilState(null, 0);
-            var target0 = rtv;
-            context->OMSetRenderTargets(1, &target0, null);
 
-            context->Draw(3, 0);
+            Effects.Render(ref frame);
         }
         finally
         {
@@ -329,7 +279,7 @@ float4 PS(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         try
         {
             ThrowIfFailed(device->CreateRenderTargetView((ID3D11Resource*)backBuffer, null, &rtv));
-            Apply(backBuffer, rtv);
+            Apply(backBuffer, rtv, null);
         }
         finally
         {
@@ -369,7 +319,9 @@ float4 PS(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             if (output == null || output->D3D11Texture2D == null || output->MipRenderTargets == null)
                 return;
 
-            Apply((ID3D11Texture2D*)output->D3D11Texture2D, (ID3D11RenderTargetView*)output->GetMipRenderTarget(0)->D3D11RenderTargetViewOrDepthStencilView);
+            var depth = PostEffectManager.Instance()->Depth;
+            Apply((ID3D11Texture2D*)output->D3D11Texture2D, (ID3D11RenderTargetView*)output->GetMipRenderTarget(0)->D3D11RenderTargetViewOrDepthStencilView,
+                depth != null ? (ID3D11ShaderResourceView*)depth->D3D11ShaderResourceView : null);
         }
         catch (Exception ex)
         {
@@ -388,11 +340,9 @@ float4 PS(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         // Commands already queued still call into this plugin; give the render thread a moment to drain them.
         Thread.Sleep(250);
 
+        Effects.Dispose();
         ReleaseCopy();
         if (rasterizer != null) rasterizer->Release();
-        if (sampler != null) sampler->Release();
-        if (pixelShader != null) pixelShader->Release();
-        if (vertexShader != null) vertexShader->Release();
         if (context != null) context->Release();
         if (device != null) device->Release();
     }
