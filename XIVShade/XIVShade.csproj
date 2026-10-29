@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+  <PropertyGroup>
+    <Version>0.0.0.1</Version>
+    <Author>Raine</Author>
+    <Name>XIVShade</Name>
+    <Punchline>ReShade-style post-processing for FFXIV.</Punchline>
+    <Description>Applies post-processing effects to the game's final image.</Description>
+    <Tags>reshade;graphics</Tags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="TerraFX.Interop.Windows">
+      <HintPath>$(DalamudLibPath)TerraFX.Interop.Windows.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>
