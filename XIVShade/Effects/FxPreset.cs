@@ -44,6 +44,7 @@ public sealed class FxPreset
             return preset;
 
         Dictionary<string, string>? section = null;
+        var sorting = new List<string>();
         foreach (var raw in File.ReadAllLines(path))
         {
             var line = raw.Trim();
@@ -67,8 +68,24 @@ public sealed class FxPreset
                 section[key] = value;
             else if (key == "Techniques")
                 preset.Techniques.AddRange(value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+            else if (key == "TechniqueSorting")
+                sorting.AddRange(value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
             else if (key == "PreprocessorDefinitions")
                 preset.PreprocessorDefinitions.AddRange(value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        }
+
+        // ReShade lists enabled techniques in declaration order and keeps the run order in TechniqueSorting.
+        if (sorting.Count > 0)
+        {
+            int Rank(string technique)
+            {
+                var index = sorting.FindIndex(k => string.Equals(k, technique, StringComparison.OrdinalIgnoreCase));
+                return index < 0 ? int.MaxValue : index;
+            }
+
+            var ordered = preset.Techniques.OrderBy(Rank).ToList();
+            preset.Techniques.Clear();
+            preset.Techniques.AddRange(ordered);
         }
 
         return preset;
