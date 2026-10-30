@@ -83,7 +83,7 @@ public sealed class FxPreset
     }
 
     public static string Format(FxUniformInfo uniform, double[] values) =>
-        string.Join(',', values.Take(uniform.Components).Select(v => uniform.Kind switch
+        string.Join(',', values.Take(uniform.Count).Select(v => uniform.Kind switch
         {
             "float" => ((float)v).ToString("R", CultureInfo.InvariantCulture),
             "bool" => v != 0 ? "1" : "0",
@@ -93,7 +93,7 @@ public sealed class FxPreset
     public static bool TryParse(FxUniformInfo uniform, string text, out double[] values)
     {
         var parts = text.Split(',', StringSplitOptions.TrimEntries);
-        values = new double[uniform.Components];
+        values = new double[uniform.Count];
         for (var i = 0; i < values.Length; i++)
         {
             var part = i < parts.Length ? parts[i] : parts[^1];

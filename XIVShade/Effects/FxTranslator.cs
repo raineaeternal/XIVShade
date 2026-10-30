@@ -30,6 +30,30 @@ public sealed class FxTranslator
         ["tex2Dlodoffset"] = "__tex2Dlodoffset",
         ["tex2Dgather"] = "__tex2Dgather",
         ["tex2Dgatheroffset"] = "__tex2Dgatheroffset",
+        ["tex1D"] = "__tex1D",
+        ["tex1Dlod"] = "__tex1Dlod",
+        ["tex1Dfetch"] = "__tex1Dfetch",
+        ["tex1Dsize"] = "__tex1Dsize",
+        ["tex3D"] = "__tex3D",
+        ["tex3Dlod"] = "__tex3Dlod",
+        ["tex3Dfetch"] = "__tex3Dfetch",
+        ["tex3Dsize"] = "__tex3Dsize",
+        ["tex1Dstore"] = "__tex1Dstore",
+        ["tex2Dstore"] = "__tex2Dstore",
+        ["tex3Dstore"] = "__tex3Dstore",
+    };
+
+    /// <summary>Type names in parameter lists that become the prelude's wrapper types.</summary>
+    private static readonly Dictionary<string, string> TypeRewrites = new()
+    {
+        ["sampler"] = "__sampler2D_float4",
+        ["sampler2D"] = "__sampler2D_float4",
+        ["sampler1D"] = "__sampler1D_float4",
+        ["sampler3D"] = "__sampler3D_float4",
+        ["storage"] = "RWTexture2D<float4>",
+        ["storage2D"] = "RWTexture2D<float4>",
+        ["storage1D"] = "RWTexture1D<float4>",
+        ["storage3D"] = "RWTexture3D<float4>",
     };
 
     private const string Prelude = @"struct __sampler2D_float4 { Texture2D<float4> t; SamplerState s; };
@@ -46,6 +70,24 @@ float4 __tex2Doffset(__sampler2D_float4 s, float2 uv, int2 o) { return s.t.Sampl
 float4 __tex2Dlodoffset(__sampler2D_float4 s, float4 uv, int2 o) { return s.t.SampleLevel(s.s, uv.xy, uv.w, o); }
 float4 __tex2Dgather(__sampler2D_float4 s, float2 uv, int comp) { return comp == 0 ? s.t.GatherRed(s.s, uv) : comp == 1 ? s.t.GatherGreen(s.s, uv) : comp == 2 ? s.t.GatherBlue(s.s, uv) : s.t.GatherAlpha(s.s, uv); }
 float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { return comp == 0 ? s.t.GatherRed(s.s, uv, o) : comp == 1 ? s.t.GatherGreen(s.s, uv, o) : comp == 2 ? s.t.GatherBlue(s.s, uv, o) : s.t.GatherAlpha(s.s, uv, o); }
+struct __sampler1D_float4 { Texture1D<float4> t; SamplerState s; };
+struct __sampler3D_float4 { Texture3D<float4> t; SamplerState s; };
+float4 __tex1D(__sampler1D_float4 s, float u) { return s.t.Sample(s.s, u); }
+float4 __tex1Dlod(__sampler1D_float4 s, float4 uv) { return s.t.SampleLevel(s.s, uv.x, uv.w); }
+float4 __tex1Dfetch(__sampler1D_float4 s, int c) { return s.t.Load(int2(c, 0)); }
+float4 __tex1Dfetch(__sampler1D_float4 s, int c, int lod) { return s.t.Load(int2(c, lod)); }
+int __tex1Dsize(__sampler1D_float4 s, int lod) { uint w, l; s.t.GetDimensions(lod, w, l); return int(w); }
+int __tex1Dsize(__sampler1D_float4 s) { uint w, l; s.t.GetDimensions(0, w, l); return int(w); }
+float4 __tex3D(__sampler3D_float4 s, float3 uvw) { return s.t.Sample(s.s, uvw); }
+float4 __tex3Dlod(__sampler3D_float4 s, float4 uvw) { return s.t.SampleLevel(s.s, uvw.xyz, uvw.w); }
+float4 __tex3Dfetch(__sampler3D_float4 s, int3 c) { return s.t.Load(int4(c, 0)); }
+float4 __tex3Dfetch(__sampler3D_float4 s, int3 c, int lod) { return s.t.Load(int4(c, lod)); }
+int3 __tex3Dsize(__sampler3D_float4 s, int lod) { uint w, h, d, l; s.t.GetDimensions(lod, w, h, d, l); return int3(w, h, d); }
+int3 __tex3Dsize(__sampler3D_float4 s) { uint w, h, d, l; s.t.GetDimensions(0, w, h, d, l); return int3(w, h, d); }
+void __tex1Dstore(RWTexture1D<float4> s, int c, float4 v) { s[c] = v; }
+void __tex2Dstore(RWTexture2D<float4> s, int2 c, float4 v) { s[c] = v; }
+void __tex3Dstore(RWTexture3D<float4> s, int3 c, float4 v) { s[c] = v; }
+float4 __tex2Dfetch(RWTexture2D<float4> s, int2 c) { return s[c]; }
 ";
 
     private readonly List<FxToken> tokens;
@@ -60,8 +102,13 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
     private readonly Dictionary<string, double> constants = new();
     private readonly HashSet<string> pixelEntries = new();
     private bool inPixelEntry;
+
+    // Index of the '{' that starts the function being emitted: semantics only appear before it.
+    private int signatureEnd;
     private readonly List<FxTextureInfo> textures = new();
     private readonly List<FxSamplerInfo> samplers = new();
+    private readonly List<FxStorageInfo> storages = new();
+    private readonly Dictionary<string, (int X, int Y, int Z)> computeEntries = new();
     private readonly List<FxSamplerState> samplerStates = new();
     private readonly List<FxUniformInfo> uniforms = new();
     private readonly List<FxTechniqueInfo> techniques = new();
@@ -149,6 +196,24 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
                 var close = MatchingBrace(index);
                 for (var i = index; i < close; i++)
                 {
+                    if (tokens[i].Is("ComputeShader") && tokens[i + 1].Is("="))
+                    {
+                        // ComputeShader = ns::Name<x, y, z>;
+                        var name = i + 2;
+                        while (tokens[name + 1].Is("::"))
+                            name += 2;
+
+                        var threads = new List<int>();
+                        for (var k = name + 2; k < close && !tokens[k].Is(">") && !tokens[k].Is(";"); k++)
+                        {
+                            if (tokens[k].Kind == FxTokenKind.Number && int.TryParse(tokens[k].Text, out var count))
+                                threads.Add(count);
+                        }
+
+                        computeEntries[tokens[name].Text] = (threads.ElementAtOrDefault(0) is var x and > 0 ? x : 1, threads.ElementAtOrDefault(1) is var y and > 0 ? y : 1, threads.ElementAtOrDefault(2) is var z and > 0 ? z : 1);
+                        continue;
+                    }
+
                     if (!tokens[i].Is("PixelShader") || !tokens[i + 1].Is("="))
                         continue;
 
@@ -252,21 +317,18 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
         var keyword = tokens[index].Text;
         if (keyword is "texture" or "texture1D" or "texture2D" or "texture3D")
         {
-            if (keyword is "texture1D" or "texture3D")
-                throw Error($"{keyword} is not supported");
             position = index + 1;
-            ParseTexture();
+            ParseTexture(keyword == "texture1D" ? 1 : keyword == "texture3D" ? 3 : 2);
         }
         else if (keyword is "sampler" or "sampler1D" or "sampler2D" or "sampler3D" && (tokens[index + 2].Is("{") || tokens[index + 2].Is("<")))
         {
-            if (keyword is "sampler1D" or "sampler3D")
-                throw Error($"{keyword} is not supported");
             position = index + 1;
             ParseSampler();
         }
-        else if (keyword is "storage" or "storage1D" or "storage2D" or "storage3D")
+        else if (keyword is "storage" or "storage1D" or "storage2D" or "storage3D" && (tokens[index + 2].Is("{") || tokens[index + 2].Is("<")))
         {
-            throw Error("Storage textures are not supported");
+            position = index + 1;
+            ParseStorage(keyword == "storage1D" ? 1 : keyword == "storage3D" ? 3 : 2);
         }
         else if (qualifiers.Contains("uniform") && !IsFunction(start))
         {
@@ -304,9 +366,21 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
         if (!isFunction)
             TryRecordConstant(start, end, qualifiers);
 
-        inPixelEntry = isFunction && DeclaredName(start, end) is { } functionName && pixelEntries.Contains(functionName);
+        var functionName = isFunction ? DeclaredName(start, end) : null;
+        if (functionName != null && computeEntries.TryGetValue(functionName, out var threads))
+            body.Append($"[numthreads({threads.X}, {threads.Y}, {threads.Z})]\n");
+
+        inPixelEntry = functionName != null && pixelEntries.Contains(functionName);
+        signatureEnd = start;
+        if (isFunction)
+        {
+            while (!tokens[signatureEnd].Is("{"))
+                signatureEnd++;
+        }
+
         EmitTokens(start, end);
         inPixelEntry = false;
+        signatureEnd = 0;
         body.Append('\n');
         position = end;
     }
@@ -419,9 +493,16 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
             }
 
             // SM3-era semantics: ReShade FX accepts them, SM5 doesn't.
-            if (t.Kind == FxTokenKind.Ident && i > start && tokens[i - 1].Is(":") && SemanticName(t.Text) is { } semantic)
+            if (t.Kind == FxTokenKind.Ident && i < signatureEnd && tokens[i - 1].Is(":") && SemanticName(t.Text) is { } semantic)
             {
                 body.Append(t.Lead).Append(semantic);
+                continue;
+            }
+
+            // 10f is valid FX but not every HLSL compiler lexes it; 10.0f is accepted everywhere.
+            if (t.Kind == FxTokenKind.Number && t.Text.Length > 1 && t.Text[^1] is 'f' or 'F' or 'h' or 'H' && t.Text[..^1].All(char.IsDigit))
+            {
+                body.Append(t.Lead).Append(t.Text[..^1]).Append(".0").Append(t.Text[^1]);
                 continue;
             }
 
@@ -433,9 +514,9 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
                     continue;
                 }
 
-                if (t.Text is "sampler" or "sampler2D")
+                if (TypeRewrites.TryGetValue(t.Text, out var rewritten))
                 {
-                    body.Append(t.Lead).Append("__sampler2D_float4");
+                    body.Append(t.Lead).Append(rewritten);
                     continue;
                 }
             }
@@ -446,7 +527,11 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
 
     private string? SemanticName(string semantic)
     {
-        var upper = semantic.ToUpperInvariant();
+        // Semantics are written in capitals; this keeps a local called "color" safe.
+        if (semantic != semantic.ToUpperInvariant())
+            return null;
+
+        var upper = semantic;
         if (upper is "POSITION" or "POSITION0" or "VPOS")
             return "SV_Position";
         if (inPixelEntry && upper.StartsWith("COLOR") && (upper.Length == 5 || (upper.Length == 6 && char.IsDigit(upper[5]))))
@@ -553,7 +638,7 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
 
     // ---- texture / sampler ----
 
-    private void ParseTexture()
+    private void ParseTexture(int dimension)
     {
         var name = Current.Text;
         position++;
@@ -576,8 +661,10 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
         {
             Name = DeclaredAs(name),
             Semantic = semantic,
+            Dimension = dimension,
             Width = properties.TryGetValue("Width", out var w) ? (int)Evaluate(w) : null,
             Height = properties.TryGetValue("Height", out var h) ? (int)Evaluate(h) : null,
+            Depth = properties.TryGetValue("Depth", out var d) ? (int)Evaluate(d) : null,
             MipLevels = properties.TryGetValue("MipLevels", out var m) ? (int)Evaluate(m) : 1,
             Format = properties.TryGetValue("Format", out var f) ? Raw(f).ToUpperInvariant() : "RGBA8",
             Source = properties.TryGetValue("Source", out var s) ? Raw(s) : null,
@@ -629,11 +716,39 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
             Srgb = properties.TryGetValue("SRGBTexture", out var srgb) && Raw(srgb).Equals("true", StringComparison.OrdinalIgnoreCase),
         });
 
-        body.Append($"Texture2D<float4> {name}_t : register(t{slot});\n");
-        body.Append($"static const __sampler2D_float4 {name} = {{ {name}_t, __ss{stateIndex} }};\n");
+        var dimension = textures.FirstOrDefault(t => t.Name == texture)?.Dimension ?? 2;
+        body.Append($"Texture{dimension}D<float4> {name}_t : register(t{slot});\n");
+        body.Append($"static const __sampler{dimension}D_float4 {name} = {{ {name}_t, __ss{stateIndex} }};\n");
+    }
+
+    private void ParseStorage(int dimension)
+    {
+        var name = Current.Text;
+        position++;
+        ParseAnnotations();
+        var properties = ParseProperties();
+        if (Current.Is(";"))
+            position++;
+
+        if (!properties.TryGetValue("Texture", out var textureTokens))
+            throw new FxException($"Storage {name} has no Texture");
+
+        var slot = storages.Count;
+        name = DeclaredAs(name);
+        storages.Add(new FxStorageInfo
+        {
+            Name = name,
+            TextureName = ResolveReference(Raw(textureTokens)),
+            MipLevel = properties.TryGetValue("MipLevel", out var mip) ? (int)Evaluate(mip) : 0,
+            Slot = slot,
+        });
+
+        body.Append($"RWTexture{dimension}D<float4> {name} : register(u{slot});\n");
     }
 
     // ---- uniforms ----
+
+    private static readonly System.Text.RegularExpressions.Regex UniformType = new(@"^(float|int|uint|bool)(?:([1-4])(?:x([1-4]))?)?$", System.Text.RegularExpressions.RegexOptions.Compiled);
 
     private void ParseUniform()
     {
@@ -642,15 +757,32 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
         var name = Current.Text;
         position++;
 
+        var match = UniformType.Match(type);
+        if (!match.Success)
+            throw new FxException($"Unsupported uniform type '{type}' ({name})");
+
+        var kind = match.Groups[1].Value;
+        var isMatrix = match.Groups[3].Success;
+        var rows = isMatrix ? int.Parse(match.Groups[2].Value) : 1;
+        var columns = isMatrix ? int.Parse(match.Groups[3].Value) : match.Groups[2].Success ? int.Parse(match.Groups[2].Value) : 1;
+
+        var arrayLength = 1;
+        var isArray = false;
         if (Current.Is("["))
-            throw new FxException($"Uniform arrays are not supported ({name})");
+        {
+            var size = new List<FxToken>();
+            position++;
+            while (!Current.Is("]") && Current.Kind != FxTokenKind.Eof)
+                size.Add(tokens[position++]);
+            position++;
+            arrayLength = (int)Evaluate(size);
+            isArray = true;
+            if (arrayLength < 1)
+                throw new FxException($"Uniform array {name} needs at least one element");
+        }
 
         var annotations = ParseAnnotations();
-
-        var kind = type.TrimEnd('1', '2', '3', '4');
-        if (kind is not ("float" or "int" or "uint" or "bool") || type.Contains('x'))
-            throw new FxException($"Unsupported uniform type '{type}' ({name})");
-        var components = type.Length > kind.Length ? type[^1] - '0' : 1;
+        var count = rows * columns * arrayLength;
 
         var defaults = new List<double>();
         if (Current.Is("="))
@@ -665,19 +797,23 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
         if (Current.Is(";"))
             position++;
 
-        // A single scalar initialises every component; anything missing is zero.
-        if (defaults.Count == 1 && components > 1)
-            defaults = Enumerable.Repeat(defaults[0], components).ToList();
-        while (defaults.Count < components)
+        // A single scalar initialises every component of an element; anything missing is zero.
+        if (defaults.Count == 1 && rows * columns > 1)
+            defaults = Enumerable.Repeat(defaults[0], rows * columns).ToList();
+        while (defaults.Count < count)
             defaults.Add(0);
 
         uniforms.Add(new FxUniformInfo
         {
             Name = DeclaredAs(name),
             Kind = kind,
-            Components = components,
+            Rows = rows,
+            Columns = columns,
+            ArrayLength = arrayLength,
+            IsArray = isArray,
+            IsMatrix = isMatrix,
             Offset = 0,
-            Default = defaults.Take(components).ToArray(),
+            Default = defaults.Take(count).ToArray(),
             Annotations = annotations,
         });
     }
@@ -694,7 +830,7 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
                 index += 2;
                 while (index < initializer.Count && !initializer[index].Is(")"))
                 {
-                    if (initializer[index].Is(","))
+                    if (initializer[index].Is(",") || initializer[index].Is("{") || initializer[index].Is("}"))
                         index++;
                     else
                         Parse();
@@ -710,7 +846,7 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
             while (index < initializer.Count)
             {
                 var t = initializer[index];
-                if (depth == 0 && (t.Is(",") || t.Is(")")))
+                if (depth == 0 && (t.Is(",") || t.Is(")") || t.Is("{") || t.Is("}")))
                     break;
                 if (t.Is("(")) depth++;
                 if (t.Is(")")) depth--;
@@ -723,6 +859,13 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
 
         while (index < initializer.Count)
         {
+            // Braces only group; the values stay in order.
+            if (initializer[index].Is("{") || initializer[index].Is("}"))
+            {
+                index++;
+                continue;
+            }
+
             Parse();
             if (index < initializer.Count && initializer[index].Is(","))
                 index++;
@@ -775,11 +918,30 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
                     raw[key] = ResolveReference(raw[key]);
             }
 
+            var compute = raw.GetValueOrDefault("ComputeShader");
+            if (compute == null)
+            {
+                if (!raw.ContainsKey("VertexShader") || !raw.ContainsKey("PixelShader"))
+                    throw new FxException($"Pass {passName} of {name} needs a VertexShader and a PixelShader, or a ComputeShader");
+            }
+            else
+            {
+                // The thread group size after the name was only needed for the [numthreads] attribute.
+                var angle = compute.IndexOf('<');
+                compute = ResolveReference(angle < 0 ? compute : compute[..angle].Trim());
+            }
+
+            int Dispatch(string key) => properties.TryGetValue(key, out var value) ? Math.Max(1, (int)Evaluate(value)) : 1;
+
             passes.Add(new FxPassInfo
             {
                 Name = passName,
-                VertexShader = raw.GetValueOrDefault("VertexShader") ?? throw new FxException($"Pass {passName} of {name} has no VertexShader"),
-                PixelShader = raw.GetValueOrDefault("PixelShader") ?? throw new FxException($"Pass {passName} of {name} has no PixelShader"),
+                VertexShader = raw.GetValueOrDefault("VertexShader"),
+                PixelShader = raw.GetValueOrDefault("PixelShader"),
+                ComputeShader = compute,
+                DispatchX = Dispatch("DispatchSizeX"),
+                DispatchY = Dispatch("DispatchSizeY"),
+                DispatchZ = Dispatch("DispatchSizeZ"),
                 Properties = raw,
             });
         }
@@ -792,15 +954,35 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
 
     private FxEffectDescription Assemble()
     {
-        // Pack the uniforms the way HLSL packs a constant buffer: 4-byte scalars, vectors may not straddle a 16-byte row.
+        // Pack the uniforms the way HLSL packs a constant buffer: 4-byte scalars, vectors may not straddle a 16-byte row,
+        // and arrays and matrices start a new row, with every array element (and matrix row) taking a whole row.
         var offset = 0;
         foreach (var uniform in uniforms)
         {
-            var size = uniform.Components * 4;
-            if (offset % 16 + size > 16)
+            if (uniform.IsMatrix)
+            {
+                var elementSize = (uniform.Rows - 1) * 16 + uniform.Columns * 4;
+                uniform.Stride = (elementSize + 15) / 16 * 16;
                 offset = (offset + 15) / 16 * 16;
-            uniform.Offset = offset;
-            offset += size;
+                uniform.Offset = offset;
+                offset += (uniform.ArrayLength - 1) * uniform.Stride + elementSize;
+            }
+            else if (uniform.IsArray)
+            {
+                var elementSize = uniform.Columns * 4;
+                uniform.Stride = 16;
+                offset = (offset + 15) / 16 * 16;
+                uniform.Offset = offset;
+                offset += (uniform.ArrayLength - 1) * 16 + elementSize;
+            }
+            else
+            {
+                var size = uniform.Columns * 4;
+                if (offset % 16 + size > 16)
+                    offset = (offset + 15) / 16 * 16;
+                uniform.Offset = offset;
+                offset += size;
+            }
         }
 
         var constantBufferSize = Math.Max(16, (offset + 15) / 16 * 16);
@@ -813,8 +995,13 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
         if (uniforms.Count > 0)
         {
             sb.Append("cbuffer _Globals : register(b0)\n{\n");
+            // Explicit offsets, so the layout the runtime writes does not depend on the compiler's packing rules.
             foreach (var uniform in uniforms)
-                sb.Append($"    {uniform.Type} {uniform.Name};\n");
+            {
+                var component = "xyzw"[uniform.Offset % 16 / 4];
+                var register = $"c{uniform.Offset / 16}" + (uniform.Offset % 16 == 0 ? "" : "." + component);
+                sb.Append($"    {(uniform.IsMatrix ? "row_major " : "")}{uniform.Type} {uniform.Name}{(uniform.IsArray ? $"[{uniform.ArrayLength}]" : "")} : packoffset({register});\n");
+            }
             sb.Append("};\n");
         }
 
@@ -825,6 +1012,7 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
             Hlsl = sb.ToString(),
             Textures = textures,
             Samplers = samplers,
+            Storages = storages,
             SamplerStates = samplerStates,
             Uniforms = uniforms,
             Techniques = techniques,

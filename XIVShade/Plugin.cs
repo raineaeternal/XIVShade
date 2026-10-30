@@ -13,6 +13,9 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
     [PluginService] internal static ICommandManager CommandManager { get; private set; } = null!;
     [PluginService] internal static IPluginLog Log { get; private set; } = null!;
+    [PluginService] internal static IFramework Framework { get; private set; } = null!;
+    [PluginService] internal static IKeyState KeyState { get; private set; } = null!;
+    [PluginService] internal static IToastGui ToastGui { get; private set; } = null!;
     [PluginService] internal static ITextureProvider TextureProvider { get; private set; } = null!;
     [PluginService] internal static ISigScanner SigScanner { get; private set; } = null!;
     [PluginService] internal static IGameInteropProvider GameInterop { get; private set; } = null!;
@@ -23,6 +26,7 @@ public sealed class Plugin : IDalamudPlugin
 
     private readonly WindowSystem windowSystem = new("XIVShade");
     private readonly PostProcessor? postProcessor;
+    private readonly Hotkeys? hotkeys;
     private readonly MainWindow mainWindow;
 
     public Plugin()
@@ -38,7 +42,10 @@ public sealed class Plugin : IDalamudPlugin
             Log.Error(ex, "Failed to set up post-processing");
         }
 
-        mainWindow = new MainWindow(Configuration, postProcessor);
+        if (postProcessor != null)
+            hotkeys = new Hotkeys(Configuration, postProcessor, Framework, KeyState, ToastGui);
+
+        mainWindow = new MainWindow(Configuration, postProcessor, hotkeys);
         windowSystem.AddWindow(mainWindow);
 
         CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
@@ -62,6 +69,7 @@ public sealed class Plugin : IDalamudPlugin
 
         CommandManager.RemoveHandler(CommandName);
 
+        hotkeys?.Dispose();
         postProcessor?.Dispose();
     }
 

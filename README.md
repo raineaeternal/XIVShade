@@ -12,8 +12,16 @@ injecting ReShade itself.
 3. On the **Effects** tab, tick the techniques you want. Their settings appear on the **Settings** tab; right-click a
    setting to reset it.
 
-Techniques run in the order you enabled them. The preset is saved as `XIVShade.ini` in the plugin's config folder in
-ReShade's format (`Techniques=`, `PreprocessorDefinitions=`, and one `[File.fx]` section per effect).
+Techniques run in the order shown under **Run order** on the Effects tab, which you can change with the Up and Down
+buttons. New techniques are added at the end.
+
+**Presets** are the `.ini` files in the plugin's `Presets` folder, in ReShade's format (`Techniques=`,
+`PreprocessorDefinitions=`, and one `[File.fx]` section per effect). Use the preset menu at the top of the window to
+switch, create (empty or as a copy of the current one) and delete them. Changes are saved as you make them.
+
+**Hotkeys** are set on the Hotkeys tab: toggle all effects, toggle Include UI, step to the next or previous preset,
+switch to a named preset, or toggle a single technique. Click a key button and press the combination you want. They do
+not fire while you are typing in chat or a text box.
 
 **Include UI** moves the effects from the 3D scene to the final presented image, so the HUD is processed as well.
 Depth (`DEPTH`/`ReShade::DepthBuffer`) is only available when the UI is not included.
@@ -25,12 +33,14 @@ The effect front end is written in C#: a C preprocessor, then a translator from 
 Effects run from a render command that the plugin inserts into the game's own command buffer, after the game's
 post-effect chain and before the UI, so they execute on the render thread alongside other plugins such as UpscaleBuddy.
 
-Supported: 2D textures and render targets (with mip generation), sampler states, uniforms of scalar and vector types
-with the common UI annotations, multi-pass techniques with render targets and blending, `COLOR` and `DEPTH` textures,
-textures loaded from image files, and the `timer`, `frametime`, `framecount`, `random` and `date` uniform sources.
+Supported: 1D, 2D and 3D textures, render targets with mip generation (2D), sampler states, scalar, vector, matrix and
+array uniforms with the common UI annotations, multi-pass techniques with render targets and blending, compute passes
+with storage textures, `COLOR` and `DEPTH` textures, 2D textures loaded from image files, and the `timer`, `frametime`,
+`framecount`, `random` and `date` uniform sources.
 
-Not supported: 1D and 3D textures, storage textures and compute passes, uniform arrays and matrix uniforms, and the
-mouse, key and overlay uniform sources (they read as zero).
+Not supported: loading 1D and 3D textures from images (they start empty and are meant to be written by compute shaders),
+render targets that are 3D or 1D textures, storage textures in pixel shaders, atomic operations, and the mouse, key and
+overlay uniform sources (they read as zero).
 
 ## Building
 

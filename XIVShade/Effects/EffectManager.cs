@@ -36,7 +36,8 @@ public sealed unsafe class EffectManager : IDisposable
     private readonly ITextureProvider textureProvider;
     private readonly IPluginLog log;
     private readonly Configuration configuration;
-    private readonly string presetPath;
+    private readonly string configDirectory;
+    private List<string> presetNames = new();
     private readonly object buildLock = new();
     private readonly List<EffectInstance> retired = new();
 
@@ -51,13 +52,131 @@ public sealed unsafe class EffectManager : IDisposable
         this.textureProvider = textureProvider;
         this.log = log;
         this.configuration = configuration;
-        presetPath = Path.Combine(configDirectory, "XIVShade.ini");
-        Preset = FxPreset.Load(presetPath);
+        this.configDirectory = configDirectory;
+        MigrateLegacyPreset();
+        RefreshPresetList();
+        Preset = FxPreset.Load(PresetPath(configuration.ActivePreset));
         Directory.CreateDirectory(ShadersDirectory);
         Directory.CreateDirectory(TexturesDirectory);
     }
 
-    public FxPreset Preset { get; }
+    public FxPreset Preset { get; private set; }
+
+    // ---- presets ----
+
+    public string PresetsDirectory => Path.Combine(configDirectory, "Presets");
+
+    public string ActivePreset => configuration.ActivePreset;
+
+    /// <summary>Names of the presets on disk, sorted.</summary>
+    public IReadOnlyList<string> PresetNames => presetNames;
+
+    private string PresetPath(string name) => Path.Combine(PresetsDirectory, name + ".ini");
+
+    /// <summary>A file-name safe version of <paramref name="name"/>, or null if nothing usable is left.</summary>
+    public static string? SanitizePresetName(string name)
+    {
+        var cleaned = new string(name.Where(c => !Path.GetInvalidFileNameChars().Contains(c)).ToArray()).Trim().TrimEnd('.');
+        return cleaned.Length == 0 ? null : cleaned;
+    }
+
+    /// <summary>The single XIVShade.ini of earlier versions becomes the preset named Default.</summary>
+    private void MigrateLegacyPreset()
+    {
+        var legacy = Path.Combine(configDirectory, "XIVShade.ini");
+        if (Directory.Exists(PresetsDirectory) || !File.Exists(legacy))
+            return;
+
+        Directory.CreateDirectory(PresetsDirectory);
+        File.Copy(legacy, PresetPath("Default"));
+    }
+
+    private void RefreshPresetList()
+    {
+        Directory.CreateDirectory(PresetsDirectory);
+        var names = Directory.EnumerateFiles(PresetsDirectory, "*.ini").Select(f => Path.GetFileNameWithoutExtension(f)).OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList();
+        if (!names.Contains(configuration.ActivePreset, StringComparer.OrdinalIgnoreCase))
+        {
+            new FxPreset().Save(PresetPath(configuration.ActivePreset));
+            names.Add(configuration.ActivePreset);
+            names.Sort(StringComparer.OrdinalIgnoreCase);
+        }
+
+        presetNames = names;
+    }
+
+    /// <summary>Makes <paramref name="name"/> the active preset and rebuilds the effects it enables.</summary>
+    public void SwitchPreset(string name)
+    {
+        if (string.Equals(name, configuration.ActivePreset, StringComparison.OrdinalIgnoreCase) || !presetNames.Contains(name))
+            return;
+
+        SaveIfDue(true);
+        configuration.ActivePreset = name;
+        configuration.Save();
+        var preset = FxPreset.Load(PresetPath(name));
+        Run(() =>
+        {
+            Preset = preset;
+            runItems = Array.Empty<RunItem>();
+            foreach (var entry in Entries)
+                Retire(entry);
+            Build();
+        });
+    }
+
+    /// <summary>Moves to the next (or previous) preset, wrapping around. Returns the new name.</summary>
+    public string StepPreset(int delta)
+    {
+        if (presetNames.Count == 0)
+            return configuration.ActivePreset;
+
+        var index = presetNames.FindIndex(n => string.Equals(n, configuration.ActivePreset, StringComparison.OrdinalIgnoreCase));
+        var next = presetNames[((index < 0 ? 0 : index) + delta % presetNames.Count + presetNames.Count) % presetNames.Count];
+        SwitchPreset(next);
+        return next;
+    }
+
+    /// <summary>Creates a preset, optionally copying the active one, and switches to it. False if the name is unusable or taken.</summary>
+    public bool CreatePreset(string name, bool copyActive)
+    {
+        var clean = SanitizePresetName(name);
+        if (clean == null || presetNames.Contains(clean, StringComparer.OrdinalIgnoreCase))
+            return false;
+
+        SaveIfDue(true);
+        (copyActive ? Preset : new FxPreset()).Save(PresetPath(clean));
+        RefreshPresetList();
+        SwitchPreset(clean);
+        return true;
+    }
+
+    /// <summary>Deletes a preset; the active one is replaced by another first. False when it is the only one.</summary>
+    public bool DeletePreset(string name)
+    {
+        if (presetNames.Count <= 1 || !presetNames.Contains(name))
+            return false;
+
+        if (string.Equals(name, configuration.ActivePreset, StringComparison.OrdinalIgnoreCase))
+            SwitchPreset(presetNames.First(n => !string.Equals(n, name, StringComparison.OrdinalIgnoreCase)));
+
+        File.Delete(PresetPath(name));
+        RefreshPresetList();
+        return true;
+    }
+
+    /// <summary>Moves an enabled technique earlier or later in the run order.</summary>
+    public void MoveTechnique(string key, int delta)
+    {
+        var index = Preset.Techniques.FindIndex(k => string.Equals(k, key, StringComparison.OrdinalIgnoreCase));
+        var target = index + delta;
+        if (index < 0 || target < 0 || target >= Preset.Techniques.Count)
+            return;
+
+        (Preset.Techniques[index], Preset.Techniques[target]) = (Preset.Techniques[target], Preset.Techniques[index]);
+        MarkDirty();
+        Refresh();
+    }
 
     public string Root => string.IsNullOrWhiteSpace(configuration.ShaderRoot)
         ? Path.Combine(Plugin.PluginInterface.GetPluginConfigDirectory(), "reshade-shaders")
@@ -318,7 +437,7 @@ public sealed unsafe class EffectManager : IDisposable
         dirtySince = null;
         try
         {
-            Preset.Save(presetPath);
+            Preset.Save(PresetPath(configuration.ActivePreset));
         }
         catch (Exception ex)
         {

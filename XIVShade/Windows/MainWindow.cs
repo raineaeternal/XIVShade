@@ -13,10 +13,13 @@ public class MainWindow : Window, IDisposable
 {
     private readonly Configuration configuration;
     private readonly PostProcessor? postProcessor;
+    private readonly Hotkeys? hotkeys;
     private string rootInput;
     private string filter = "";
+    private string newPresetName = "";
+    private string presetMessage = "";
 
-    public MainWindow(Configuration configuration, PostProcessor? postProcessor)
+    public MainWindow(Configuration configuration, PostProcessor? postProcessor, Hotkeys? hotkeys)
         : base("XIVShade###XIVShadeMain")
     {
         SizeConstraints = new WindowSizeConstraints
@@ -27,6 +30,7 @@ public class MainWindow : Window, IDisposable
 
         this.configuration = configuration;
         this.postProcessor = postProcessor;
+        this.hotkeys = hotkeys;
         rootInput = postProcessor?.Effects.Root ?? "";
     }
 
@@ -63,6 +67,8 @@ public class MainWindow : Window, IDisposable
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("Apply effects after the UI is drawn. Off: only the 3D scene is affected.");
 
+        DrawPresetBar(effects);
+
         if (!ImGui.BeginTabBar("##tabs"))
             return;
 
@@ -75,6 +81,12 @@ public class MainWindow : Window, IDisposable
         if (ImGui.BeginTabItem("Settings"))
         {
             DrawSettings(effects);
+            ImGui.EndTabItem();
+        }
+
+        if (ImGui.BeginTabItem("Hotkeys"))
+        {
+            DrawHotkeys(effects);
             ImGui.EndTabItem();
         }
 
@@ -98,6 +110,8 @@ public class MainWindow : Window, IDisposable
                 : $"No effects found in {effects.ShadersDirectory}. Put ReShade .fx files there, or point to a folder on the Folder tab.");
             return;
         }
+
+        DrawOrder(effects);
 
         ImGui.SetNextItemWidth(-1);
         ImGui.InputTextWithHint("##filter", "Filter", ref filter, 128);
@@ -138,6 +152,202 @@ public class MainWindow : Window, IDisposable
         }
 
         ImGui.EndChild();
+    }
+
+    /// <summary>The enabled techniques in the order they run, with buttons to move them.</summary>
+    private static void DrawOrder(EffectManager effects)
+    {
+        var order = effects.Preset.Techniques.ToList();
+        if (order.Count < 2 || !ImGui.CollapsingHeader($"Run order ({order.Count})"))
+            return;
+
+        for (var i = 0; i < order.Count; i++)
+        {
+            var key = order[i];
+            ImGui.PushID(key);
+            if (ImGui.SmallButton("Up") && i > 0)
+                effects.MoveTechnique(key, -1);
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Down") && i < order.Count - 1)
+                effects.MoveTechnique(key, 1);
+            ImGui.SameLine();
+            ImGui.TextUnformatted($"{i + 1}. {key.Replace("@", "  (")})");
+            ImGui.PopID();
+        }
+
+        ImGui.Separator();
+    }
+
+    // ---- presets ----
+
+    private void DrawPresetBar(EffectManager effects)
+    {
+        ImGui.SetNextItemWidth(180);
+        if (ImGui.BeginCombo("##preset", effects.ActivePreset))
+        {
+            foreach (var name in effects.PresetNames)
+            {
+                if (ImGui.Selectable(name, string.Equals(name, effects.ActivePreset, StringComparison.OrdinalIgnoreCase)))
+                    effects.SwitchPreset(name);
+            }
+
+            ImGui.EndCombo();
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("New..."))
+        {
+            presetMessage = "";
+            ImGui.OpenPopup("##newpreset");
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("Delete"))
+            ImGui.OpenPopup("##deletepreset");
+
+        if (ImGui.BeginPopup("##newpreset"))
+        {
+            ImGui.TextUnformatted("Preset name");
+            ImGui.SetNextItemWidth(220);
+            ImGui.InputText("##newname", ref newPresetName, 64);
+            var created = false;
+            if (ImGui.Button("Create empty"))
+                created = Create(effects, false);
+            ImGui.SameLine();
+            if (ImGui.Button("Copy current"))
+                created = Create(effects, true);
+            if (created)
+                ImGui.CloseCurrentPopup();
+
+            if (presetMessage.Length > 0)
+                ImGui.TextColored(new Vector4(1, 0.4f, 0.4f, 1), presetMessage);
+            ImGui.EndPopup();
+        }
+
+        if (ImGui.BeginPopup("##deletepreset"))
+        {
+            ImGui.TextUnformatted($"Delete preset '{effects.ActivePreset}'?");
+            if (ImGui.Button("Delete"))
+            {
+                effects.DeletePreset(effects.ActivePreset);
+                ImGui.CloseCurrentPopup();
+            }
+
+            ImGui.SameLine();
+            if (ImGui.Button("Cancel"))
+                ImGui.CloseCurrentPopup();
+            ImGui.EndPopup();
+        }
+    }
+
+    private bool Create(EffectManager effects, bool copy)
+    {
+        if (effects.CreatePreset(newPresetName, copy))
+        {
+            newPresetName = "";
+            return true;
+        }
+
+        presetMessage = "Enter a name that is not already used.";
+        return false;
+    }
+
+    // ---- hotkeys ----
+
+    private void DrawHotkeys(EffectManager effects)
+    {
+        if (hotkeys == null)
+        {
+            ImGui.TextUnformatted("Hotkeys are unavailable.");
+            return;
+        }
+
+        var techniques = effects.Entries
+            .Where(e => e.Description != null)
+            .SelectMany(e => e.Description!.Techniques.Select(t => (Key: FxPreset.Key(t.Name, e.Path), Label: $"{t.Label}  ({e.Name})")))
+            .ToList();
+
+        var remove = (HotkeyBinding?)null;
+        foreach (var binding in configuration.Hotkeys)
+        {
+            ImGui.PushID(binding.GetHashCode());
+
+            var action = (int)binding.Action;
+            var actions = Enum.GetNames<HotkeyAction>();
+            ImGui.SetNextItemWidth(150);
+            if (ImGui.Combo("##action", ref action, actions, actions.Length))
+            {
+                binding.Action = (HotkeyAction)action;
+                binding.Argument = "";
+                configuration.Save();
+            }
+
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(220);
+            if (binding.Action == HotkeyAction.SetPreset)
+            {
+                if (ImGui.BeginCombo("##argument", binding.Argument.Length > 0 ? binding.Argument : "Choose preset"))
+                {
+                    foreach (var name in effects.PresetNames)
+                    {
+                        if (ImGui.Selectable(name, name == binding.Argument))
+                        {
+                            binding.Argument = name;
+                            configuration.Save();
+                        }
+                    }
+
+                    ImGui.EndCombo();
+                }
+            }
+            else if (binding.Action == HotkeyAction.ToggleTechnique)
+            {
+                var current = techniques.FirstOrDefault(t => string.Equals(t.Key, binding.Argument, StringComparison.OrdinalIgnoreCase)).Label ?? "Choose technique";
+                if (ImGui.BeginCombo("##argument", current))
+                {
+                    foreach (var (key, label) in techniques)
+                    {
+                        if (ImGui.Selectable(label, string.Equals(key, binding.Argument, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            binding.Argument = key;
+                            configuration.Save();
+                        }
+                    }
+
+                    ImGui.EndCombo();
+                }
+            }
+            else
+            {
+                ImGui.Dummy(new Vector2(220, 1));
+            }
+
+            ImGui.SameLine();
+            var capturing = hotkeys.Capturing == binding;
+            if (ImGui.Button(capturing ? "Press a key (Esc cancels)" : Hotkeys.Describe(binding), new Vector2(190, 0)))
+                hotkeys.BeginCapture(binding, _ => configuration.Save());
+
+            ImGui.SameLine();
+            if (ImGui.Button("Remove"))
+                remove = binding;
+
+            ImGui.PopID();
+        }
+
+        if (remove != null)
+        {
+            hotkeys.CancelCapture();
+            configuration.Hotkeys.Remove(remove);
+            configuration.Save();
+        }
+
+        if (ImGui.Button("Add hotkey"))
+        {
+            configuration.Hotkeys.Add(new HotkeyBinding());
+            configuration.Save();
+        }
+
+        ImGui.TextDisabled("Hotkeys do not fire while you are typing in chat or in a text box.");
     }
 
     // ---- uniforms ----
@@ -201,6 +411,11 @@ public class MainWindow : Window, IDisposable
         var changed = false;
 
         ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X * 0.55f);
+        if (uniform.IsArray || uniform.IsMatrix)
+        {
+            return DrawRows(uniform, values, hasRange, min, max);
+        }
+
         if (uniform.Kind == "bool")
         {
             var value = values[0] != 0;
@@ -285,6 +500,97 @@ public class MainWindow : Window, IDisposable
         }
 
         return Tooltip(uniform, changed);
+    }
+
+    /// <summary>Array and matrix uniforms: one row of controls per array element or matrix row.</summary>
+    private static bool DrawRows(FxUniformInfo uniform, double[] values, bool hasRange, double min, double max)
+    {
+        var changed = false;
+        ImGui.TextUnformatted(uniform.Label);
+        var rowCount = uniform.ArrayLength * uniform.Rows;
+        for (var row = 0; row < rowCount; row++)
+        {
+            var offset = row * uniform.Columns;
+            var label = $"##{uniform.Name}{row}";
+            ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X * 0.55f);
+            if (uniform.Kind == "float")
+            {
+                var v = new float[] { (float)values[offset], uniform.Columns > 1 ? (float)values[offset + 1] : 0, uniform.Columns > 2 ? (float)values[offset + 2] : 0, uniform.Columns > 3 ? (float)values[offset + 3] : 0 };
+                var edited = uniform.Columns switch
+                {
+                    1 => hasRange ? ImGui.SliderFloat(label, ref v[0], (float)min, (float)max) : ImGui.DragFloat(label, ref v[0], 0.01f),
+                    2 => RowVector2(label, v, hasRange, min, max),
+                    3 => RowVector3(label, v, hasRange, min, max),
+                    _ => RowVector4(label, v, hasRange, min, max),
+                };
+
+                if (edited)
+                {
+                    for (var c = 0; c < uniform.Columns; c++)
+                        values[offset + c] = v[c];
+                    changed = true;
+                }
+            }
+            else
+            {
+                for (var c = 0; c < uniform.Columns; c++)
+                {
+                    if (c > 0)
+                        ImGui.SameLine();
+                    ImGui.SetNextItemWidth(60);
+                    if (uniform.Kind == "bool")
+                    {
+                        var flag = values[offset + c] != 0;
+                        if (ImGui.Checkbox($"{label}{c}", ref flag))
+                        {
+                            values[offset + c] = flag ? 1 : 0;
+                            changed = true;
+                        }
+                    }
+                    else
+                    {
+                        var v = (int)values[offset + c];
+                        if (ImGui.DragInt($"{label}{c}", ref v))
+                        {
+                            values[offset + c] = v;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        return changed;
+    }
+
+    private static bool RowVector2(string label, float[] v, bool hasRange, double min, double max)
+    {
+        var value = new Vector2(v[0], v[1]);
+        var edited = hasRange ? ImGui.SliderFloat2(label, ref value, (float)min, (float)max) : ImGui.DragFloat2(label, ref value, 0.01f);
+        v[0] = value.X;
+        v[1] = value.Y;
+        return edited;
+    }
+
+    private static bool RowVector3(string label, float[] v, bool hasRange, double min, double max)
+    {
+        var value = new Vector3(v[0], v[1], v[2]);
+        var edited = hasRange ? ImGui.SliderFloat3(label, ref value, (float)min, (float)max) : ImGui.DragFloat3(label, ref value, 0.01f);
+        v[0] = value.X;
+        v[1] = value.Y;
+        v[2] = value.Z;
+        return edited;
+    }
+
+    private static bool RowVector4(string label, float[] v, bool hasRange, double min, double max)
+    {
+        var value = new Vector4(v[0], v[1], v[2], v[3]);
+        var edited = hasRange ? ImGui.SliderFloat4(label, ref value, (float)min, (float)max) : ImGui.DragFloat4(label, ref value, 0.01f);
+        v[0] = value.X;
+        v[1] = value.Y;
+        v[2] = value.Z;
+        v[3] = value.W;
+        return edited;
     }
 
     private static bool Tooltip(FxUniformInfo uniform, bool changed)

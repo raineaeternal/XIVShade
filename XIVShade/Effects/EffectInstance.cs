@@ -40,10 +40,12 @@ public sealed unsafe class EffectInstance : IDisposable
 
     private sealed class TextureResource
     {
-        public ID3D11Texture2D* Texture;
+        public ID3D11Resource* Resource;
+        public int Dimension = 2;
         public ID3D11ShaderResourceView* Linear;
         public ID3D11ShaderResourceView* Srgb;
         public ID3D11RenderTargetView* RenderTarget;
+        public DXGI_FORMAT UavFormat;
         public uint Width, Height;
         public uint MipLevels;
         public IDisposable? Owner;
@@ -52,11 +54,12 @@ public sealed unsafe class EffectInstance : IDisposable
     private sealed class PassState
     {
         public required FxPassInfo Info;
-        public required ID3D11VertexShader* VertexShader;
-        public required ID3D11PixelShader* PixelShader;
+        public ID3D11VertexShader* VertexShader;
+        public ID3D11PixelShader* PixelShader;
+        public ID3D11ComputeShader* ComputeShader;
         public required string[] RenderTargets;
         public required bool Clear;
-        public required ID3D11BlendState* Blend;
+        public ID3D11BlendState* Blend;
         public required D3D_PRIMITIVE_TOPOLOGY Topology;
         public required uint VertexCount;
     }
@@ -64,6 +67,8 @@ public sealed unsafe class EffectInstance : IDisposable
     private readonly ID3D11Device* device;
     private readonly Dictionary<string, nint> vertexShaders = new();
     private readonly Dictionary<string, nint> pixelShaders = new();
+    private readonly Dictionary<string, nint> computeShaders = new();
+    private readonly Dictionary<string, nint> unorderedViews = new();
     private readonly List<nint> samplerStates = new();
     private readonly List<nint> blendStates = new();
     private readonly Dictionary<string, TextureResource> textures = new();
@@ -115,8 +120,14 @@ public sealed unsafe class EffectInstance : IDisposable
         {
             foreach (var pass in technique.Passes)
             {
-                CompileOnce(vertexShaders, pass.VertexShader, "vs_5_0", errors);
-                CompileOnce(pixelShaders, pass.PixelShader, "ps_5_0", errors);
+                if (pass.ComputeShader != null)
+                {
+                    CompileOnce(computeShaders, pass.ComputeShader, "cs_5_0", errors);
+                    continue;
+                }
+
+                CompileOnce(vertexShaders, pass.VertexShader!, "vs_5_0", errors);
+                CompileOnce(pixelShaders, pass.PixelShader!, "ps_5_0", errors);
             }
         }
 
@@ -147,6 +158,9 @@ public sealed unsafe class EffectInstance : IDisposable
 
             if (info.Source != null)
             {
+                if (info.Dimension != 2)
+                    throw new FxException($"Texture {info.Name}: loading 1D and 3D textures from images is not supported");
+
                 var image = loadImage(info.Source) ?? throw new FxException($"Texture image '{info.Source}' could not be loaded");
                 textures[info.Name] = new TextureResource
                 {
@@ -162,6 +176,14 @@ public sealed unsafe class EffectInstance : IDisposable
             {
                 textures[info.Name] = CreateTexture(info, width, height);
             }
+        }
+
+        foreach (var storage in Description.Storages)
+        {
+            if (!textures.TryGetValue(storage.TextureName, out var resource) || resource.Resource == null || resource.UavFormat == DXGI_FORMAT.DXGI_FORMAT_UNKNOWN)
+                throw new FxException($"Storage {storage.Name}: texture '{storage.TextureName}' cannot be written from a shader");
+
+            unorderedViews[storage.Name] = (nint)CreateUnorderedView(resource, textureInfos[storage.TextureName], storage.MipLevel);
         }
 
         foreach (var technique in Description.Techniques)
@@ -182,6 +204,12 @@ public sealed unsafe class EffectInstance : IDisposable
                 {
                     ID3D11VertexShader* shader;
                     Check(device->CreateVertexShader(pBytes, (nuint)bytecode.Length, null, &shader));
+                    shaders[entry] = (nint)shader;
+                }
+                else if (profile.StartsWith("cs"))
+                {
+                    ID3D11ComputeShader* shader;
+                    Check(device->CreateComputeShader(pBytes, (nuint)bytecode.Length, null, &shader));
                     shaders[entry] = (nint)shader;
                 }
                 else
@@ -254,56 +282,143 @@ public sealed unsafe class EffectInstance : IDisposable
 
     private TextureResource CreateTexture(FxTextureInfo info, uint bufferWidth, uint bufferHeight)
     {
-        var width = (uint)(info.Width ?? (int)bufferWidth);
-        var height = (uint)(info.Height ?? (int)bufferHeight);
+        var width = (uint)(info.Width ?? (info.Dimension == 1 ? 1 : (int)bufferWidth));
+        var height = (uint)(info.Height ?? (info.Dimension == 1 ? 1 : (int)bufferHeight));
+        var depth = (uint)(info.Depth ?? 1);
         var mips = (uint)Math.Max(1, info.MipLevels);
         var (resourceFormat, linearFormat, srgbFormat) = Format(info.Format);
 
-        var desc = new D3D11_TEXTURE2D_DESC
+        // A texture some compute shader writes to needs unordered access, and cannot be typeless.
+        var written = Description.Storages.Any(st => st.TextureName == info.Name);
+        var renderable = info.Dimension == 2;
+        var bindFlags = D3D11_BIND_FLAG.D3D11_BIND_SHADER_RESOURCE;
+        if (renderable)
+            bindFlags |= D3D11_BIND_FLAG.D3D11_BIND_RENDER_TARGET;
+        if (written)
         {
-            Width = width,
-            Height = height,
-            MipLevels = mips,
-            ArraySize = 1,
-            Format = resourceFormat,
-            SampleDesc = new DXGI_SAMPLE_DESC(1, 0),
-            Usage = D3D11_USAGE.D3D11_USAGE_DEFAULT,
-            BindFlags = (uint)(D3D11_BIND_FLAG.D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_FLAG.D3D11_BIND_RENDER_TARGET),
-            MiscFlags = mips > 1 ? (uint)D3D11_RESOURCE_MISC_FLAG.D3D11_RESOURCE_MISC_GENERATE_MIPS : 0,
-        };
+            bindFlags |= D3D11_BIND_FLAG.D3D11_BIND_UNORDERED_ACCESS;
+            resourceFormat = linearFormat;
+        }
 
-        var resource = new TextureResource { Width = width, Height = height, MipLevels = mips };
-        ID3D11Texture2D* texture;
-        Check(device->CreateTexture2D(&desc, null, &texture));
-        resource.Texture = texture;
+        var miscFlags = renderable && mips > 1 ? (uint)D3D11_RESOURCE_MISC_FLAG.D3D11_RESOURCE_MISC_GENERATE_MIPS : 0;
+        var resource = new TextureResource { Width = width, Height = height, MipLevels = mips, Dimension = info.Dimension, UavFormat = written ? linearFormat : DXGI_FORMAT.DXGI_FORMAT_UNKNOWN };
 
-        resource.Linear = CreateView(texture, linearFormat, mips);
-        resource.Srgb = srgbFormat == linearFormat ? resource.Linear : CreateView(texture, srgbFormat, mips);
-        if (resource.Srgb == resource.Linear)
+        switch (info.Dimension)
+        {
+            case 1:
+            {
+                var desc = new D3D11_TEXTURE1D_DESC
+                {
+                    Width = width, MipLevels = mips, ArraySize = 1, Format = resourceFormat,
+                    Usage = D3D11_USAGE.D3D11_USAGE_DEFAULT, BindFlags = (uint)bindFlags,
+                };
+                ID3D11Texture1D* texture;
+                Check(device->CreateTexture1D(&desc, null, &texture));
+                resource.Resource = (ID3D11Resource*)texture;
+                break;
+            }
+            case 3:
+            {
+                var desc = new D3D11_TEXTURE3D_DESC
+                {
+                    Width = width, Height = height, Depth = depth, MipLevels = mips, Format = resourceFormat,
+                    Usage = D3D11_USAGE.D3D11_USAGE_DEFAULT, BindFlags = (uint)bindFlags,
+                };
+                ID3D11Texture3D* texture;
+                Check(device->CreateTexture3D(&desc, null, &texture));
+                resource.Resource = (ID3D11Resource*)texture;
+                break;
+            }
+            default:
+            {
+                var desc = new D3D11_TEXTURE2D_DESC
+                {
+                    Width = width, Height = height, MipLevels = mips, ArraySize = 1, Format = resourceFormat,
+                    SampleDesc = new DXGI_SAMPLE_DESC(1, 0), Usage = D3D11_USAGE.D3D11_USAGE_DEFAULT,
+                    BindFlags = (uint)bindFlags, MiscFlags = miscFlags,
+                };
+                ID3D11Texture2D* texture;
+                Check(device->CreateTexture2D(&desc, null, &texture));
+                resource.Resource = (ID3D11Resource*)texture;
+                break;
+            }
+        }
+
+        resource.Linear = CreateView(resource.Resource, info.Dimension, linearFormat, mips);
+        if (srgbFormat == linearFormat || written)
+        {
+            resource.Srgb = resource.Linear;
             ((IUnknown*)resource.Linear)->AddRef();
-
-        var rtvDesc = new D3D11_RENDER_TARGET_VIEW_DESC
+        }
+        else
         {
-            Format = linearFormat,
-            ViewDimension = D3D11_RTV_DIMENSION.D3D11_RTV_DIMENSION_TEXTURE2D,
-        };
-        ID3D11RenderTargetView* rtv;
-        Check(device->CreateRenderTargetView((ID3D11Resource*)texture, &rtvDesc, &rtv));
-        resource.RenderTarget = rtv;
+            resource.Srgb = CreateView(resource.Resource, info.Dimension, srgbFormat, mips);
+        }
+
+        if (renderable)
+        {
+            var rtvDesc = new D3D11_RENDER_TARGET_VIEW_DESC
+            {
+                Format = linearFormat,
+                ViewDimension = D3D11_RTV_DIMENSION.D3D11_RTV_DIMENSION_TEXTURE2D,
+            };
+            ID3D11RenderTargetView* rtv;
+            Check(device->CreateRenderTargetView(resource.Resource, &rtvDesc, &rtv));
+            resource.RenderTarget = rtv;
+        }
+
         return resource;
     }
 
-    private ID3D11ShaderResourceView* CreateView(ID3D11Texture2D* texture, DXGI_FORMAT format, uint mips)
+    private ID3D11UnorderedAccessView* CreateUnorderedView(TextureResource resource, FxTextureInfo info, int mipLevel)
     {
-        var desc = new D3D11_SHADER_RESOURCE_VIEW_DESC
+        var desc = new D3D11_UNORDERED_ACCESS_VIEW_DESC { Format = resource.UavFormat };
+        switch (info.Dimension)
         {
-            Format = format,
-            ViewDimension = D3D_SRV_DIMENSION.D3D_SRV_DIMENSION_TEXTURE2D,
-        };
-        desc.Texture2D.MostDetailedMip = 0;
-        desc.Texture2D.MipLevels = mips;
+            case 1:
+                desc.ViewDimension = D3D11_UAV_DIMENSION.D3D11_UAV_DIMENSION_TEXTURE1D;
+                desc.Texture1D.MipSlice = (uint)mipLevel;
+                break;
+            case 3:
+                desc.ViewDimension = D3D11_UAV_DIMENSION.D3D11_UAV_DIMENSION_TEXTURE3D;
+                desc.Texture3D.MipSlice = (uint)mipLevel;
+                desc.Texture3D.WSize = Math.Max(1u, resource.Resource == null ? 1u : (uint)(info.Depth ?? 1) >> mipLevel);
+                break;
+            default:
+                desc.ViewDimension = D3D11_UAV_DIMENSION.D3D11_UAV_DIMENSION_TEXTURE2D;
+                desc.Texture2D.MipSlice = (uint)mipLevel;
+                break;
+        }
+
+        ID3D11UnorderedAccessView* view;
+        Check(device->CreateUnorderedAccessView(resource.Resource, &desc, &view));
+        return view;
+    }
+
+    private ID3D11ShaderResourceView* CreateView(ID3D11Resource* resource, int dimension, DXGI_FORMAT format, uint mips)
+    {
+        var desc = new D3D11_SHADER_RESOURCE_VIEW_DESC { Format = format };
+        switch (dimension)
+        {
+            case 1:
+                desc.ViewDimension = D3D_SRV_DIMENSION.D3D_SRV_DIMENSION_TEXTURE1D;
+                desc.Texture1D.MostDetailedMip = 0;
+                desc.Texture1D.MipLevels = mips;
+                break;
+            case 3:
+                desc.ViewDimension = D3D_SRV_DIMENSION.D3D_SRV_DIMENSION_TEXTURE3D;
+                desc.Texture3D.MostDetailedMip = 0;
+                desc.Texture3D.MipLevels = mips;
+                break;
+            default:
+                desc.ViewDimension = D3D_SRV_DIMENSION.D3D_SRV_DIMENSION_TEXTURE2D;
+                desc.Texture2D.MostDetailedMip = 0;
+                desc.Texture2D.MipLevels = mips;
+                break;
+        }
+
         ID3D11ShaderResourceView* view;
-        Check(device->CreateShaderResourceView((ID3D11Resource*)texture, &desc, &view));
+        Check(device->CreateShaderResourceView(resource, &desc, &view));
         return view;
     }
 
@@ -348,8 +463,19 @@ public sealed unsafe class EffectInstance : IDisposable
         string Get(string key, string fallback) => properties.TryGetValue(key, out var value) ? value.ToUpperInvariant() : fallback;
         bool Flag(string key, bool fallback) => properties.TryGetValue(key, out var value) ? value.Equals("true", StringComparison.OrdinalIgnoreCase) || value == "1" : fallback;
 
-        if (properties.ContainsKey("DispatchSizeX"))
-            throw new FxException($"Pass {pass.Name}: compute passes are not supported");
+        if (pass.ComputeShader != null)
+        {
+            return new PassState
+            {
+                Info = pass,
+                ComputeShader = (ID3D11ComputeShader*)computeShaders[pass.ComputeShader],
+                RenderTargets = Array.Empty<string>(),
+                Clear = false,
+                Blend = null,
+                Topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                VertexCount = 0,
+            };
+        }
 
         var targets = new List<string>();
         for (var i = 0; i < 8; i++)
@@ -383,8 +509,8 @@ public sealed unsafe class EffectInstance : IDisposable
         return new PassState
         {
             Info = pass,
-            VertexShader = (ID3D11VertexShader*)vertexShaders[pass.VertexShader],
-            PixelShader = (ID3D11PixelShader*)pixelShaders[pass.PixelShader],
+            VertexShader = (ID3D11VertexShader*)vertexShaders[pass.VertexShader!],
+            PixelShader = (ID3D11PixelShader*)pixelShaders[pass.PixelShader!],
             RenderTargets = targets.ToArray(),
             Clear = Flag("ClearRenderTargets", true),
             Blend = blend,
@@ -412,20 +538,26 @@ public sealed unsafe class EffectInstance : IDisposable
 
         var viewport = new D3D11_VIEWPORT(0, 0, frame.Width, frame.Height);
         var targetViews = stackalloc ID3D11RenderTargetView*[8];
-        var boundTextures = stackalloc ID3D11Texture2D*[8];
+        var boundTextures = stackalloc ID3D11Resource*[8];
         var views = stackalloc ID3D11ShaderResourceView*[Math.Max(1, Description.Samplers.Count)];
         var transparent = stackalloc float[4] { 0, 0, 0, 0 };
         var passList = passes[technique];
         for (var index = 0; index < passList.Length; index++)
         {
             var pass = passList[index];
+            if (pass.ComputeShader != null)
+            {
+                Dispatch(pass, context, frame, views);
+                continue;
+            }
+
             var targetCount = 0u;
             var writesTarget = pass.RenderTargets.Length == 0;
 
             if (writesTarget)
             {
                 targetViews[0] = frame.TargetView;
-                boundTextures[0] = frame.Target;
+                boundTextures[0] = (ID3D11Resource*)frame.Target;
                 targetCount = 1;
                 viewport = new D3D11_VIEWPORT(0, 0, frame.Width, frame.Height);
             }
@@ -436,7 +568,7 @@ public sealed unsafe class EffectInstance : IDisposable
                     if (!textures.TryGetValue(name, out var resource) || resource.RenderTarget == null)
                         throw new FxException($"Pass {pass.Info.Name}: render target '{name}' is not available");
                     targetViews[targetCount] = resource.RenderTarget;
-                    boundTextures[targetCount] = resource.Texture;
+                    boundTextures[targetCount] = resource.Resource;
                     targetCount++;
                     viewport = new D3D11_VIEWPORT(0, 0, resource.Width, resource.Height);
                 }
@@ -476,7 +608,7 @@ public sealed unsafe class EffectInstance : IDisposable
                 foreach (var name in pass.RenderTargets)
                 {
                     var resource = textures[name];
-                    if (resource.MipLevels > 1)
+                    if (resource.MipLevels > 1 && resource.Dimension == 2)
                         context->GenerateMips(resource.Linear);
                 }
             }
@@ -488,7 +620,49 @@ public sealed unsafe class EffectInstance : IDisposable
         }
     }
 
-    private ID3D11ShaderResourceView* ResolveView(FxSamplerInfo sampler, in FrameInputs frame, ID3D11Texture2D** bound, int boundCount)
+    /// <summary>Runs a compute pass: shader resources and the effect's storage textures bound to the compute stage.</summary>
+    private void Dispatch(PassState pass, ID3D11DeviceContext* context, in FrameInputs frame, ID3D11ShaderResourceView** views)
+    {
+        var count = Description.Storages.Count;
+        var written = stackalloc ID3D11Resource*[Math.Max(1, count)];
+        var uavs = stackalloc ID3D11UnorderedAccessView*[Math.Max(1, count)];
+        for (var i = 0; i < count; i++)
+        {
+            var storage = Description.Storages[i];
+            uavs[i] = (ID3D11UnorderedAccessView*)unorderedViews[storage.Name];
+            written[i] = textures[storage.TextureName].Resource;
+        }
+
+        for (var i = 0; i < Description.Samplers.Count; i++)
+            views[i] = ResolveView(Description.Samplers[i], frame, written, count);
+
+        var buffer = constantBuffer;
+        context->CSSetConstantBuffers(0, 1, &buffer);
+        context->CSSetShaderResources(0, (uint)Description.Samplers.Count, views);
+        var initialCounts = stackalloc uint[Math.Max(1, count)];
+        for (var i = 0; i < count; i++)
+            initialCounts[i] = 0xFFFFFFFF;
+        context->CSSetUnorderedAccessViews(0, (uint)count, uavs, initialCounts);
+
+        var samplerList = stackalloc ID3D11SamplerState*[Math.Max(1, samplerStates.Count)];
+        for (var i = 0; i < samplerStates.Count; i++)
+            samplerList[i] = (ID3D11SamplerState*)samplerStates[i];
+        context->CSSetSamplers(0, (uint)samplerStates.Count, samplerList);
+
+        context->CSSetShader(pass.ComputeShader, null, 0);
+        context->Dispatch((uint)pass.Info.DispatchX, (uint)pass.Info.DispatchY, (uint)pass.Info.DispatchZ);
+
+        // Unbind everything so the next pass (and the game) can use the textures.
+        context->CSSetShader(null, null, 0);
+        for (var i = 0; i < count; i++)
+            uavs[i] = null;
+        context->CSSetUnorderedAccessViews(0, (uint)count, uavs, initialCounts);
+        for (var i = 0; i < Description.Samplers.Count; i++)
+            views[i] = null;
+        context->CSSetShaderResources(0, (uint)Description.Samplers.Count, views);
+    }
+
+    private ID3D11ShaderResourceView* ResolveView(FxSamplerInfo sampler, in FrameInputs frame, ID3D11Resource** bound, int boundCount)
     {
         textureInfos.TryGetValue(sampler.TextureName, out var info);
         if (info?.Semantic == "COLOR")
@@ -501,7 +675,7 @@ public sealed unsafe class EffectInstance : IDisposable
 
         for (var i = 0; i < boundCount; i++)
         {
-            if (resource.Texture != null && resource.Texture == bound[i])
+            if (resource.Resource != null && resource.Resource == bound[i])
                 return null;
         }
 
@@ -553,7 +727,7 @@ public sealed unsafe class EffectInstance : IDisposable
                 }
             }
 
-            for (var i = 0; i < uniform.Components; i++)
+            for (var i = 0; i < uniform.Count; i++)
                 Write(uniform, i, values[i]);
         }
 
@@ -568,7 +742,7 @@ public sealed unsafe class EffectInstance : IDisposable
 
     private void Write(FxUniformInfo uniform, int component, double value)
     {
-        var span = constantData.AsSpan(uniform.Offset + component * 4, 4);
+        var span = constantData.AsSpan(uniform.ByteOffset(component), 4);
         switch (uniform.Kind)
         {
             case "float":
@@ -601,6 +775,8 @@ public sealed unsafe class EffectInstance : IDisposable
     {
         foreach (var shader in vertexShaders.Values) Release((void*)shader);
         foreach (var shader in pixelShaders.Values) Release((void*)shader);
+        foreach (var shader in computeShaders.Values) Release((void*)shader);
+        foreach (var view in unorderedViews.Values) Release((void*)view);
         foreach (var state in samplerStates) Release((void*)state);
         foreach (var state in blendStates) Release((void*)state);
         foreach (var texture in textures.Values)
@@ -614,12 +790,14 @@ public sealed unsafe class EffectInstance : IDisposable
             Release(texture.RenderTarget);
             Release(texture.Srgb);
             Release(texture.Linear);
-            Release(texture.Texture);
+            Release(texture.Resource);
         }
 
         Release(constantBuffer);
         vertexShaders.Clear();
         pixelShaders.Clear();
+        computeShaders.Clear();
+        unorderedViews.Clear();
         samplerStates.Clear();
         blendStates.Clear();
         textures.Clear();
