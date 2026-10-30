@@ -367,7 +367,8 @@ public class MainWindow : Window, IDisposable
 
     private void DrawSettings(EffectManager effects)
     {
-        var active = effects.Entries.Where(e => e.Instance != null).ToList();
+        // Instance is cleared from a background thread; hold on to each one for the whole frame.
+        var active = effects.Entries.Select(e => (Entry: e, Instance: e.Instance)).Where(e => e.Instance != null).ToList();
         if (active.Count == 0)
         {
             ImGui.TextWrapped("Enable a technique on the Effects tab to adjust its settings here.");
@@ -380,19 +381,19 @@ public class MainWindow : Window, IDisposable
             return;
         }
 
-        foreach (var entry in active)
+        foreach (var (entry, instance) in active)
         {
             if (!ImGui.CollapsingHeader(entry.Name, ImGuiTreeNodeFlags.DefaultOpen))
                 continue;
 
             ImGui.PushID(entry.Name);
-            foreach (var uniform in entry.Instance!.Description.Uniforms)
+            foreach (var uniform in instance!.Description.Uniforms)
             {
                 // Uniforms fed by the engine (timers and the like), and ones the effect hides, have no control.
                 if (uniform.Source != null || uniform.Annotations.GetValueOrDefault("ui_type") == "none")
                     continue;
 
-                if (DrawUniform(entry.Instance, uniform))
+                if (DrawUniform(instance, uniform))
                     effects.NotifyUniformChanged(entry, uniform);
 
                 if (ImGui.BeginPopupContextItem($"##reset{uniform.Name}"))
