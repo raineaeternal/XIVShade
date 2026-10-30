@@ -295,6 +295,10 @@ public sealed unsafe class EffectManager : IDisposable
             entries.Add(entry);
         }
 
+        // The old entries' GPU objects would otherwise be unreachable once the list is replaced.
+        foreach (var old in Entries)
+            Retire(old);
+
         Entries = entries;
         ScanInstalledPresets();
         Build();
