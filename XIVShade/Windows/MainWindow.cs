@@ -157,18 +157,18 @@ public class MainWindow : Window, IDisposable
     /// <summary>The enabled techniques in the order they run, with buttons to move them.</summary>
     private static void DrawOrder(EffectManager effects)
     {
-        var order = effects.Preset.Techniques.ToList();
-        if (order.Count < 2 || !ImGui.CollapsingHeader($"Run order ({order.Count})"))
+        var order = effects.Preset.TechniqueSnapshot();
+        if (order.Length < 2 || !ImGui.CollapsingHeader($"Run order ({order.Length})"))
             return;
 
-        for (var i = 0; i < order.Count; i++)
+        for (var i = 0; i < order.Length; i++)
         {
             var key = order[i];
             ImGui.PushID(key);
             if (ImGui.SmallButton("Up") && i > 0)
                 effects.MoveTechnique(key, -1);
             ImGui.SameLine();
-            if (ImGui.SmallButton("Down") && i < order.Count - 1)
+            if (ImGui.SmallButton("Down") && i < order.Length - 1)
                 effects.MoveTechnique(key, 1);
             ImGui.SameLine();
             ImGui.TextUnformatted($"{i + 1}. {key.Replace("@", "  (")})");

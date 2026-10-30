@@ -19,9 +19,23 @@ public sealed class FxPreset
     /// <summary>Uniform values by effect file name, then uniform name, as written in the file.</summary>
     public Dictionary<string, Dictionary<string, string>> Values { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Held while changing or enumerating the preset: the UI, build and render threads all touch it.</summary>
+    public object Sync { get; } = new();
+
+    /// <summary>A copy of <see cref="Techniques"/> that is safe to enumerate.</summary>
+    public string[] TechniqueSnapshot()
+    {
+        lock (Sync)
+            return Techniques.ToArray();
+    }
+
     public static string Key(string technique, string file) => technique + "@" + Path.GetFileName(file);
 
-    public bool IsEnabled(string technique, string file) => Techniques.Contains(Key(technique, file), StringComparer.OrdinalIgnoreCase);
+    public bool IsEnabled(string technique, string file)
+    {
+        lock (Sync)
+            return Techniques.Contains(Key(technique, file), StringComparer.OrdinalIgnoreCase);
+    }
 
     public static FxPreset Load(string path)
     {
@@ -62,6 +76,18 @@ public sealed class FxPreset
 
     public void Save(string path)
     {
+        string text;
+        lock (Sync)
+            text = Serialize();
+
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var temporary = path + ".tmp";
+        File.WriteAllText(temporary, text);
+        File.Move(temporary, path, true);
+    }
+
+    private string Serialize()
+    {
         var sb = new StringBuilder();
         sb.Append("PreprocessorDefinitions=").Append(string.Join(',', PreprocessorDefinitions)).Append('\n');
         sb.Append("Techniques=").Append(string.Join(',', Techniques)).Append('\n');
@@ -76,10 +102,7 @@ public sealed class FxPreset
                 sb.Append(name).Append('=').Append(value).Append('\n');
         }
 
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        var temporary = path + ".tmp";
-        File.WriteAllText(temporary, sb.ToString());
-        File.Move(temporary, path, true);
+        return sb.ToString();
     }
 
     public static string Format(FxUniformInfo uniform, double[] values) =>

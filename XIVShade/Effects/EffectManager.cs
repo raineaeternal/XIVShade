@@ -261,12 +261,17 @@ public sealed unsafe class EffectManager : IDisposable
     /// <summary>Moves an enabled technique earlier or later in the run order.</summary>
     public void MoveTechnique(string key, int delta)
     {
-        var index = Preset.Techniques.FindIndex(k => string.Equals(k, key, StringComparison.OrdinalIgnoreCase));
-        var target = index + delta;
-        if (index < 0 || target < 0 || target >= Preset.Techniques.Count)
-            return;
+        int index, target;
+        lock (Preset.Sync)
+        {
+            index = Preset.Techniques.FindIndex(k => string.Equals(k, key, StringComparison.OrdinalIgnoreCase));
+            target = index + delta;
+            if (index < 0 || target < 0 || target >= Preset.Techniques.Count)
+                return;
+        }
 
-        (Preset.Techniques[index], Preset.Techniques[target]) = (Preset.Techniques[target], Preset.Techniques[index]);
+        lock (Preset.Sync)
+            (Preset.Techniques[index], Preset.Techniques[target]) = (Preset.Techniques[target], Preset.Techniques[index]);
         MarkDirty();
         Refresh();
     }
@@ -350,7 +355,11 @@ public sealed unsafe class EffectManager : IDisposable
             ["BUFFER_COLOR_BIT_DEPTH"] = "8",
         };
 
-        foreach (var definition in Preset.PreprocessorDefinitions)
+        string[] presetDefinitions;
+        lock (Preset.Sync)
+            presetDefinitions = Preset.PreprocessorDefinitions.ToArray();
+
+        foreach (var definition in presetDefinitions)
         {
             var equals = definition.IndexOf('=');
             if (equals > 0)
@@ -383,10 +392,11 @@ public sealed unsafe class EffectManager : IDisposable
     /// <summary>Creates instances for effects with enabled techniques, drops the others, and publishes the run list.</summary>
     private void Build()
     {
+        var preset = Preset;
         var size = bufferSize;
         foreach (var entry in Entries)
         {
-            var wanted = entry.Description != null && entry.Description.Techniques.Any(t => Preset.IsEnabled(t.Name, entry.Path));
+            var wanted = entry.Description != null && entry.Description.Techniques.Any(t => preset.IsEnabled(t.Name, entry.Path));
             if (!wanted)
             {
                 Retire(entry);
@@ -417,7 +427,7 @@ public sealed unsafe class EffectManager : IDisposable
         }
 
         var items = new List<RunItem>();
-        foreach (var key in Preset.Techniques)
+        foreach (var key in preset.TechniqueSnapshot())
         {
             var at = key.LastIndexOf('@');
             if (at < 0)
@@ -437,13 +447,16 @@ public sealed unsafe class EffectManager : IDisposable
 
     private void ApplyPresetValues(EffectEntry entry, EffectInstance instance)
     {
-        if (!Preset.Values.TryGetValue(System.IO.Path.GetFileName(entry.Path), out var saved))
-            return;
-
-        foreach (var uniform in instance.Description.Uniforms)
+        lock (Preset.Sync)
         {
-            if (saved.TryGetValue(uniform.Name, out var text) && FxPreset.TryParse(uniform, text, out var values))
-                instance.Values[uniform.Name] = values;
+            if (!Preset.Values.TryGetValue(System.IO.Path.GetFileName(entry.Path), out var saved))
+                return;
+
+            foreach (var uniform in instance.Description.Uniforms)
+            {
+                if (saved.TryGetValue(uniform.Name, out var text) && FxPreset.TryParse(uniform, text, out var values))
+                    instance.Values[uniform.Name] = values;
+            }
         }
     }
 
@@ -494,9 +507,12 @@ public sealed unsafe class EffectManager : IDisposable
     public void SetTechniqueEnabled(EffectEntry entry, FxTechniqueInfo technique, bool enabled)
     {
         var key = FxPreset.Key(technique.Name, entry.Path);
-        Preset.Techniques.RemoveAll(k => string.Equals(k, key, StringComparison.OrdinalIgnoreCase));
-        if (enabled)
-            Preset.Techniques.Add(key);
+        lock (Preset.Sync)
+        {
+            Preset.Techniques.RemoveAll(k => string.Equals(k, key, StringComparison.OrdinalIgnoreCase));
+            if (enabled)
+                Preset.Techniques.Add(key);
+        }
 
         MarkDirty();
         Refresh();
@@ -509,9 +525,13 @@ public sealed unsafe class EffectManager : IDisposable
             return;
 
         var file = System.IO.Path.GetFileName(entry.Path);
-        if (!Preset.Values.TryGetValue(file, out var values))
-            Preset.Values[file] = values = new Dictionary<string, string>();
-        values[uniform.Name] = FxPreset.Format(uniform, entry.Instance.Values[uniform.Name]);
+        lock (Preset.Sync)
+        {
+            if (!Preset.Values.TryGetValue(file, out var values))
+                Preset.Values[file] = values = new Dictionary<string, string>();
+            values[uniform.Name] = FxPreset.Format(uniform, entry.Instance.Values[uniform.Name]);
+        }
+
         MarkDirty();
     }
 
@@ -588,7 +608,8 @@ public sealed unsafe class EffectManager : IDisposable
             {
                 log.Error(ex, $"{item.Instance.FileName}: {item.Technique.Name} failed, disabling it");
                 var key = FxPreset.Key(item.Technique.Name, item.Instance.FileName);
-                Preset.Techniques.RemoveAll(k => string.Equals(k, key, StringComparison.OrdinalIgnoreCase));
+                lock (Preset.Sync)
+                    Preset.Techniques.RemoveAll(k => string.Equals(k, key, StringComparison.OrdinalIgnoreCase));
                 runItems = runItems.Where(r => r != item).ToArray();
             }
         }
