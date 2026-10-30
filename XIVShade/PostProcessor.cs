@@ -327,12 +327,21 @@ public sealed unsafe class PostProcessor : IDisposable
             if (chain->PartCount == 0)
                 return;
 
-            var output = chain->Parts[chain->PartCount - 1]->OutputTextures[0].Value;
+            // These can be missing for a frame, for example while the game recreates its targets: skip the frame.
+            var part = chain->Parts[chain->PartCount - 1];
+            if (part == null)
+                return;
+
+            var output = part->OutputTextures[0].Value;
             if (output == null || output->D3D11Texture2D == null || output->MipRenderTargets == null)
                 return;
 
+            var renderTarget = output->GetMipRenderTarget(0);
+            if (renderTarget == null || renderTarget->D3D11RenderTargetViewOrDepthStencilView == null)
+                return;
+
             var depth = PostEffectManager.Instance()->Depth;
-            Apply((ID3D11Texture2D*)output->D3D11Texture2D, (ID3D11RenderTargetView*)output->GetMipRenderTarget(0)->D3D11RenderTargetViewOrDepthStencilView,
+            Apply((ID3D11Texture2D*)output->D3D11Texture2D, (ID3D11RenderTargetView*)renderTarget->D3D11RenderTargetViewOrDepthStencilView,
                 depth != null ? (ID3D11ShaderResourceView*)depth->D3D11ShaderResourceView : null);
         }
         catch (Exception ex)
