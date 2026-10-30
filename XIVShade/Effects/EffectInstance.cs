@@ -22,6 +22,10 @@ public unsafe struct FrameInputs
     public ID3D11ShaderResourceView* ColorLinear;
     public ID3D11ShaderResourceView* ColorSrgb;
 
+    /// <summary>A texture like the target with an sRGB view to draw through, or null when the format has none.</summary>
+    public ID3D11Texture2D* Scratch;
+    public ID3D11RenderTargetView* ScratchSrgbView;
+
     /// <summary>The scene depth (the DEPTH texture), or null when unavailable.</summary>
     public ID3D11ShaderResourceView* Depth;
 
@@ -45,6 +49,9 @@ public sealed unsafe class EffectInstance : IDisposable
         public ID3D11ShaderResourceView* Linear;
         public ID3D11ShaderResourceView* Srgb;
         public ID3D11RenderTargetView* RenderTarget;
+
+        /// <summary>Draws with SRGBWriteEnable; the same view as <see cref="RenderTarget"/> when the format has no sRGB form.</summary>
+        public ID3D11RenderTargetView* RenderTargetSrgb;
         public DXGI_FORMAT UavFormat;
         public uint Width, Height;
         public uint MipLevels;
@@ -59,6 +66,7 @@ public sealed unsafe class EffectInstance : IDisposable
         public ID3D11ComputeShader* ComputeShader;
         public required string[] RenderTargets;
         public required bool Clear;
+        public required bool SrgbWrite;
         public ID3D11BlendState* Blend;
         public required D3D_PRIMITIVE_TOPOLOGY Topology;
         public required uint VertexCount;
@@ -365,6 +373,18 @@ public sealed unsafe class EffectInstance : IDisposable
             ID3D11RenderTargetView* rtv;
             Check(device->CreateRenderTargetView(resource.Resource, &rtvDesc, &rtv));
             resource.RenderTarget = rtv;
+
+            if (resource.Srgb == resource.Linear)
+            {
+                resource.RenderTargetSrgb = rtv;
+                ((IUnknown*)rtv)->AddRef();
+            }
+            else
+            {
+                rtvDesc.Format = srgbFormat;
+                Check(device->CreateRenderTargetView(resource.Resource, &rtvDesc, &rtv));
+                resource.RenderTargetSrgb = rtv;
+            }
         }
 
         return resource;
@@ -471,6 +491,7 @@ public sealed unsafe class EffectInstance : IDisposable
                 ComputeShader = (ID3D11ComputeShader*)computeShaders[pass.ComputeShader],
                 RenderTargets = Array.Empty<string>(),
                 Clear = false,
+                SrgbWrite = false,
                 Blend = null,
                 Topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
                 VertexCount = 0,
@@ -513,6 +534,7 @@ public sealed unsafe class EffectInstance : IDisposable
             PixelShader = (ID3D11PixelShader*)pixelShaders[pass.PixelShader!],
             RenderTargets = targets.ToArray(),
             Clear = Flag("ClearRenderTargets", true),
+            SrgbWrite = Flag("SRGBWriteEnable", false),
             Blend = blend,
             Topology = Topology(Get("PrimitiveTopology", "TRIANGLELIST")),
             VertexCount = properties.TryGetValue("VertexCount", out var count) && uint.TryParse(count, out var vertexCount) ? vertexCount : 3,
@@ -554,7 +576,19 @@ public sealed unsafe class EffectInstance : IDisposable
             var targetCount = 0u;
             var writesTarget = pass.RenderTargets.Length == 0;
 
-            if (writesTarget)
+            // The target has no sRGB view, so an sRGB pass draws into the scratch texture, starting from the target's
+            // contents for blending, and the result is copied back after.
+            var throughScratch = writesTarget && pass.SrgbWrite && frame.ScratchSrgbView != null;
+
+            if (throughScratch)
+            {
+                context->CopyResource((ID3D11Resource*)frame.Scratch, (ID3D11Resource*)frame.Target);
+                targetViews[0] = frame.ScratchSrgbView;
+                boundTextures[0] = (ID3D11Resource*)frame.Scratch;
+                targetCount = 1;
+                viewport = new D3D11_VIEWPORT(0, 0, frame.Width, frame.Height);
+            }
+            else if (writesTarget)
             {
                 targetViews[0] = frame.TargetView;
                 boundTextures[0] = (ID3D11Resource*)frame.Target;
@@ -567,7 +601,7 @@ public sealed unsafe class EffectInstance : IDisposable
                 {
                     if (!textures.TryGetValue(name, out var resource) || resource.RenderTarget == null)
                         throw new FxException($"Pass {pass.Info.Name}: render target '{name}' is not available");
-                    targetViews[targetCount] = resource.RenderTarget;
+                    targetViews[targetCount] = pass.SrgbWrite ? resource.RenderTargetSrgb : resource.RenderTarget;
                     boundTextures[targetCount] = resource.Resource;
                     targetCount++;
                     viewport = new D3D11_VIEWPORT(0, 0, resource.Width, resource.Height);
@@ -602,6 +636,9 @@ public sealed unsafe class EffectInstance : IDisposable
                 views[i] = null;
             context->PSSetShaderResources(0, (uint)Description.Samplers.Count, views);
             context->OMSetRenderTargets(0, null, null);
+
+            if (throughScratch)
+                context->CopyResource((ID3D11Resource*)frame.Target, (ID3D11Resource*)frame.Scratch);
 
             if (!writesTarget)
             {
@@ -787,6 +824,7 @@ public sealed unsafe class EffectInstance : IDisposable
                 continue;
             }
 
+            Release(texture.RenderTargetSrgb);
             Release(texture.RenderTarget);
             Release(texture.Srgb);
             Release(texture.Linear);

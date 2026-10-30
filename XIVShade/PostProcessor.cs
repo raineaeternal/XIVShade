@@ -53,6 +53,10 @@ public sealed unsafe class PostProcessor : IDisposable
     private ID3D11Texture2D* copy;
     private ID3D11ShaderResourceView* copyLinear;
     private ID3D11ShaderResourceView* copySrgb;
+
+    // Where passes with SRGBWriteEnable draw before their result is copied to the target, which has no sRGB view.
+    private ID3D11Texture2D* scratch;
+    private ID3D11RenderTargetView* scratchSrgb;
     private uint copyWidth, copyHeight;
     private DXGI_FORMAT copyFormat;
 
@@ -142,6 +146,8 @@ public sealed unsafe class PostProcessor : IDisposable
         if (copyLinear != null) { copyLinear->Release(); copyLinear = null; }
         if (copySrgb != null) { copySrgb->Release(); copySrgb = null; }
         if (copy != null) { copy->Release(); copy = null; }
+        if (scratchSrgb != null) { scratchSrgb->Release(); scratchSrgb = null; }
+        if (scratch != null) { scratch->Release(); scratch = null; }
         copyWidth = copyHeight = 0;
     }
 
@@ -191,6 +197,21 @@ public sealed unsafe class PostProcessor : IDisposable
         fixed (ID3D11ShaderResourceView** pView = &copySrgb)
             ThrowIfFailed(device->CreateShaderResourceView((ID3D11Resource*)copy, &viewDesc, pView));
 
+        if (srgbFormat != linearFormat)
+        {
+            desc.BindFlags = (uint)D3D11_BIND_FLAG.D3D11_BIND_RENDER_TARGET;
+            fixed (ID3D11Texture2D** pScratch = &scratch)
+                ThrowIfFailed(device->CreateTexture2D(&desc, null, pScratch));
+
+            var targetDesc = new D3D11_RENDER_TARGET_VIEW_DESC
+            {
+                Format = srgbFormat,
+                ViewDimension = D3D11_RTV_DIMENSION.D3D11_RTV_DIMENSION_TEXTURE2D,
+            };
+            fixed (ID3D11RenderTargetView** pTarget = &scratchSrgb)
+                ThrowIfFailed(device->CreateRenderTargetView((ID3D11Resource*)scratch, &targetDesc, pTarget));
+        }
+
         copyWidth = backDesc.Width;
         copyHeight = backDesc.Height;
         copyFormat = backDesc.Format;
@@ -215,6 +236,8 @@ public sealed unsafe class PostProcessor : IDisposable
             ColorCopy = copy,
             ColorLinear = copyLinear,
             ColorSrgb = copySrgb,
+            Scratch = scratch,
+            ScratchSrgbView = scratchSrgb,
             Depth = depth,
             Width = desc.Width,
             Height = desc.Height,
