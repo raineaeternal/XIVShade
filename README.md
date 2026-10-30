@@ -18,6 +18,9 @@ buttons. New techniques are added at the end.
 **Presets** are the `.ini` files in the plugin's `Presets` folder, in ReShade's format (`Techniques=`,
 `PreprocessorDefinitions=`, and one `[File.fx]` section per effect). Use the preset menu at the top of the window to
 switch, create (empty or as a copy of the current one) and delete them. Changes are saved as you make them.
+Existing ReShade presets are found automatically, in the shader folder and in `reshade-presets`, `Presets`,
+`GShade-Presets` or `presets` folders beside or inside it; they appear at the bottom of the preset menu and are copied
+into XIVShade's presets when you select one.
 
 **Hotkeys** are set on the Hotkeys tab: toggle all effects, toggle Include UI, step to the next or previous preset,
 switch to a named preset, or toggle a single technique. Click a key button and press the combination you want. They do

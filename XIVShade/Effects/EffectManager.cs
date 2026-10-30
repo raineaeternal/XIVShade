@@ -8,6 +8,9 @@ using TerraFX.Interop.DirectX;
 
 namespace XIVShade.Effects;
 
+/// <summary>A ReShade preset found on disk outside XIVShade's own preset folder.</summary>
+public sealed record InstalledPreset(string Name, string Path);
+
 /// <summary>One .fx file found in the shaders folder.</summary>
 public sealed class EffectEntry
 {
@@ -78,6 +81,95 @@ public sealed unsafe class EffectManager : IDisposable
     {
         var cleaned = new string(name.Where(c => !Path.GetInvalidFileNameChars().Contains(c)).ToArray()).Trim().TrimEnd('.');
         return cleaned.Length == 0 ? null : cleaned;
+    }
+
+    /// <summary>ReShade presets found next to the shaders and in the usual preset folders; import one to use it.</summary>
+    public IReadOnlyList<InstalledPreset> InstalledPresets { get; private set; } = Array.Empty<InstalledPreset>();
+
+    private static readonly string[] PresetFolderNames = { "reshade-presets", "Presets", "GShade-Presets", "presets" };
+
+    /// <summary>Looks for preset files in the shader root and in preset folders beside it and inside it.</summary>
+    public void ScanInstalledPresets()
+    {
+        var roots = new List<string> { Root };
+        var parent = Path.GetDirectoryName(Root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        if (parent != null)
+            roots.Add(parent);
+
+        var directories = new List<(string Path, SearchOption Option)> { (Root, SearchOption.TopDirectoryOnly) };
+        foreach (var root in roots)
+        {
+            foreach (var name in PresetFolderNames)
+                directories.Add((Path.Combine(root, name), SearchOption.AllDirectories));
+        }
+
+        var found = new Dictionary<string, InstalledPreset>(StringComparer.OrdinalIgnoreCase);
+        var ours = Path.GetFullPath(PresetsDirectory);
+        foreach (var (directory, option) in directories)
+        {
+            if (!Directory.Exists(directory) || Path.GetFullPath(directory).StartsWith(ours, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            try
+            {
+                foreach (var file in Directory.EnumerateFiles(directory, "*.ini", option).Take(500))
+                {
+                    var full = Path.GetFullPath(file);
+                    if (!found.ContainsKey(full) && IsReShadePreset(full))
+                        found[full] = new InstalledPreset(Path.GetFileNameWithoutExtension(full), full);
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Warning($"Could not scan {directory} for presets: {ex.Message}");
+            }
+        }
+
+        InstalledPresets = found.Values.OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    /// <summary>A preset has a Techniques= line before any [Section]; ReShade's own ReShade.ini does not.</summary>
+    private static bool IsReShadePreset(string path)
+    {
+        try
+        {
+            using var reader = new StreamReader(path);
+            for (var i = 0; i < 40 && reader.ReadLine() is { } line; i++)
+            {
+                line = line.Trim();
+                if (line.StartsWith("Techniques=", StringComparison.OrdinalIgnoreCase))
+                    return true;
+                if (line.StartsWith('['))
+                    return false;
+            }
+        }
+        catch (IOException)
+        {
+        }
+
+        return false;
+    }
+
+    /// <summary>Copies an installed preset into XIVShade's presets under a free name and switches to it.</summary>
+    public void ImportPreset(InstalledPreset preset)
+    {
+        var baseName = SanitizePresetName(preset.Name) ?? "Imported";
+        var name = baseName;
+        for (var i = 2; presetNames.Contains(name, StringComparer.OrdinalIgnoreCase); i++)
+            name = $"{baseName} ({i})";
+
+        try
+        {
+            File.Copy(preset.Path, PresetPath(name));
+        }
+        catch (Exception ex)
+        {
+            log.Warning($"Could not import {preset.Path}: {ex.Message}");
+            return;
+        }
+
+        RefreshPresetList();
+        SwitchPreset(name);
     }
 
     /// <summary>The single XIVShade.ini of earlier versions becomes the preset named Default.</summary>
@@ -204,6 +296,7 @@ public sealed unsafe class EffectManager : IDisposable
         }
 
         Entries = entries;
+        ScanInstalledPresets();
         Build();
     });
 

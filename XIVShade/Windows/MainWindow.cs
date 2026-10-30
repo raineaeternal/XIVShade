@@ -191,6 +191,19 @@ public class MainWindow : Window, IDisposable
                     effects.SwitchPreset(name);
             }
 
+            if (effects.InstalledPresets.Count > 0)
+            {
+                ImGui.Separator();
+                ImGui.TextDisabled("Installed (select to import)");
+                foreach (var installed in effects.InstalledPresets)
+                {
+                    if (ImGui.Selectable($"{installed.Name}##{installed.Path}"))
+                        effects.ImportPreset(installed);
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip(installed.Path);
+                }
+            }
+
             ImGui.EndCombo();
         }
 
@@ -631,6 +644,6 @@ public class MainWindow : Window, IDisposable
         ImGui.Spacing();
         ImGui.TextDisabled($"Shaders:  {effects.ShadersDirectory}");
         ImGui.TextDisabled($"Textures: {effects.TexturesDirectory}");
-        ImGui.TextDisabled($"Found {effects.Entries.Count} effect files{(effects.IsBusy ? " (working...)" : "")}.");
+        ImGui.TextDisabled($"Found {effects.Entries.Count} effect files and {effects.InstalledPresets.Count} installed presets{(effects.IsBusy ? " (working...)" : "")}.");
     }
 }
