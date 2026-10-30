@@ -206,10 +206,11 @@ public sealed unsafe class EffectManager : IDisposable
         SaveIfDue(true);
         configuration.ActivePreset = name;
         configuration.Save();
-        var preset = FxPreset.Load(PresetPath(name));
+
+        // Swap the preset now: until it is, saves and edits would go to the new file with the old preset's contents.
+        Preset = FxPreset.Load(PresetPath(name));
         Run(() =>
         {
-            Preset = preset;
             runItems = Array.Empty<RunItem>();
             foreach (var entry in Entries)
                 Retire(entry);
