@@ -58,9 +58,12 @@ public sealed class FxTranslator
 
     private const string Prelude = @"struct __sampler2D_float4 { Texture2D<float4> t; SamplerState s; };
 float4 __tex2D(__sampler2D_float4 s, float2 uv) { return s.t.Sample(s.s, uv); }
+float4 __tex2D(__sampler2D_float4 s, float2 uv, int2 o) { return s.t.Sample(s.s, uv, o); }
 float4 __tex2Dlod(__sampler2D_float4 s, float4 uv) { return s.t.SampleLevel(s.s, uv.xy, uv.w); }
+float4 __tex2Dlod(__sampler2D_float4 s, float4 uv, int2 o) { return s.t.SampleLevel(s.s, uv.xy, uv.w, o); }
 float4 __tex2Dbias(__sampler2D_float4 s, float4 uv) { return s.t.SampleBias(s.s, uv.xy, uv.w); }
 float4 __tex2Dgrad(__sampler2D_float4 s, float2 uv, float2 dx, float2 dy) { return s.t.SampleGrad(s.s, uv, dx, dy); }
+float4 __tex2Dgrad(__sampler2D_float4 s, float2 uv, float2 dx, float2 dy, int2 o) { return s.t.SampleGrad(s.s, uv, dx, dy, o); }
 float4 __tex2Dfetch(__sampler2D_float4 s, int2 c) { return s.t.Load(int3(c, 0)); }
 float4 __tex2Dfetch(__sampler2D_float4 s, int2 c, int lod) { return s.t.Load(int3(c, lod)); }
 float4 __tex2Dfetch(__sampler2D_float4 s, int4 c) { return s.t.Load(int3(c.xy, c.w)); }
@@ -73,13 +76,17 @@ float4 __tex2Dgatheroffset(__sampler2D_float4 s, float2 uv, int2 o, int comp) { 
 struct __sampler1D_float4 { Texture1D<float4> t; SamplerState s; };
 struct __sampler3D_float4 { Texture3D<float4> t; SamplerState s; };
 float4 __tex1D(__sampler1D_float4 s, float u) { return s.t.Sample(s.s, u); }
+float4 __tex1D(__sampler1D_float4 s, float u, int o) { return s.t.Sample(s.s, u, o); }
 float4 __tex1Dlod(__sampler1D_float4 s, float4 uv) { return s.t.SampleLevel(s.s, uv.x, uv.w); }
+float4 __tex1Dlod(__sampler1D_float4 s, float4 uv, int o) { return s.t.SampleLevel(s.s, uv.x, uv.w, o); }
 float4 __tex1Dfetch(__sampler1D_float4 s, int c) { return s.t.Load(int2(c, 0)); }
 float4 __tex1Dfetch(__sampler1D_float4 s, int c, int lod) { return s.t.Load(int2(c, lod)); }
 int __tex1Dsize(__sampler1D_float4 s, int lod) { uint w, l; s.t.GetDimensions(lod, w, l); return int(w); }
 int __tex1Dsize(__sampler1D_float4 s) { uint w, l; s.t.GetDimensions(0, w, l); return int(w); }
 float4 __tex3D(__sampler3D_float4 s, float3 uvw) { return s.t.Sample(s.s, uvw); }
+float4 __tex3D(__sampler3D_float4 s, float3 uvw, int3 o) { return s.t.Sample(s.s, uvw, o); }
 float4 __tex3Dlod(__sampler3D_float4 s, float4 uvw) { return s.t.SampleLevel(s.s, uvw.xyz, uvw.w); }
+float4 __tex3Dlod(__sampler3D_float4 s, float4 uvw, int3 o) { return s.t.SampleLevel(s.s, uvw.xyz, uvw.w, o); }
 float4 __tex3Dfetch(__sampler3D_float4 s, int3 c) { return s.t.Load(int4(c, 0)); }
 float4 __tex3Dfetch(__sampler3D_float4 s, int3 c, int lod) { return s.t.Load(int4(c, lod)); }
 int3 __tex3Dsize(__sampler3D_float4 s, int lod) { uint w, h, d, l; s.t.GetDimensions(lod, w, h, d, l); return int3(w, h, d); }
