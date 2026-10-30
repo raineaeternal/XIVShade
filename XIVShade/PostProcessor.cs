@@ -74,24 +74,36 @@ public sealed unsafe class PostProcessor : IDisposable
         fixed (ID3D11DeviceContext** pContext = &context)
             device->GetImmediateContext(pContext);
 
-        CreateRasterizer();
-        Effects = new EffectManager(device, textureProvider, log, configuration, configDirectory);
-        Effects.Rescan();
+        try
+        {
+            CreateRasterizer();
+            Effects = new EffectManager(device, textureProvider, log, configuration, configDirectory);
+            Effects.Rescan();
 
-        callback = Run;
-        callbackFunction = Marshal.GetFunctionPointerForDelegate(callback);
+            callback = Run;
+            callbackFunction = Marshal.GetFunctionPointerForDelegate(callback);
 
-        // The scene is finished once the vignetting chain's commands run, and the UI is drawn on top afterwards.
-        // Queue ours right after that chain's commands, with the same view and sort key, so it executes next
-        // (commands are merge-sorted by key, equal keys keep submission order).
-        renderChainHook = interop.HookFromAddress<RenderChainDelegate>(sigScanner.ScanText(RenderChainSignature), RenderChainDetour);
-        renderChainHook.Enable();
+            // The scene is finished once the vignetting chain's commands run, and the UI is drawn on top afterwards.
+            // Queue ours right after that chain's commands, with the same view and sort key, so it executes next
+            // (commands are merge-sorted by key, equal keys keep submission order).
+            renderChainHook = interop.HookFromAddress<RenderChainDelegate>(sigScanner.ScanText(RenderChainSignature), RenderChainDetour);
+            renderChainHook.Enable();
 
-        // For IncludeUi: the UI may be drawn on its own layer and frames may be generated and written straight to
-        // the back buffer (UpscaleBuddy), so the only place every presented image, UI included, is reliably
-        // visible is the swapchain's Present.
-        presentHook = interop.HookFromAddress<PresentDelegate>((*(nint**)swapChain)[8], PresentDetour);
-        presentHook.Enable();
+            // For IncludeUi: the UI may be drawn on its own layer and frames may be generated and written straight to
+            // the back buffer (UpscaleBuddy), so the only place every presented image, UI included, is reliably
+            // visible is the swapchain's Present.
+            presentHook = interop.HookFromAddress<PresentDelegate>((*(nint**)swapChain)[8], PresentDetour);
+            presentHook.Enable();
+        }
+        catch
+        {
+            // Nothing owns these yet; the plugin never gets the object to dispose.
+            renderChainHook?.Dispose();
+            presentHook?.Dispose();
+            Release();
+            throw;
+        }
+
         log.Information("Post-processor installed");
     }
 
@@ -334,17 +346,22 @@ public sealed unsafe class PostProcessor : IDisposable
     {
         Enabled = false;
         stopped = true;
-        renderChainHook.Dispose();
-        presentHook.Dispose();
+        renderChainHook?.Dispose();
+        presentHook?.Dispose();
 
         // Commands already queued still call into this plugin; give the render thread a moment to drain them.
         Thread.Sleep(250);
 
-        Effects.Dispose();
+        Release();
+    }
+
+    private void Release()
+    {
+        Effects?.Dispose();
         ReleaseCopy();
-        if (rasterizer != null) rasterizer->Release();
-        if (context != null) context->Release();
-        if (device != null) device->Release();
+        if (rasterizer != null) { rasterizer->Release(); rasterizer = null; }
+        if (context != null) { context->Release(); context = null; }
+        if (device != null) { device->Release(); device = null; }
     }
 
     /// <summary>The pipeline state touched by <see cref="Apply"/>, restored afterwards so the game and other plugins are unaffected.</summary>
